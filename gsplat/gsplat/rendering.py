@@ -373,7 +373,6 @@ def rasterization(
     # assert to verify is the RGB and Hyperspectral mode
     if use_hyperspectral == True:
         if rendering_mode == "spectral_sh":
-
             assert sh_hyperspectral == True and sh_degree >= 0, "If you are in Hyperspectral Mode with SH the sh degree must be [0,1,2,3]"
         else:
             assert sh_degree == None and sh_hyperspectral == False, "Rendering mode spectral without SH sh_degree is None, sh_hyperspectral False"
@@ -502,21 +501,7 @@ def rasterization(
     # and the rasterize computation over cameras. So first we gather the cameras
     # from all ranks for projection.
     if distributed:
-        assert batch_dims == (), "Distributed mode does not support batch dimensions"
-        world_rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-
-        # Gather the number of Gaussians in each rank.
-        N_world = all_gather_int32(world_size, N, device=device)
-
-        # Enforce that the number of cameras is the same across all ranks.
-        C_world = [C] * world_size
-        viewmats, Ks = all_gather_tensor_list(world_size, [viewmats, Ks])
-        if viewmats_rs is not None:
-            (viewmats_rs,) = all_gather_tensor_list(world_size, [viewmats_rs])
-
-        # Silently change C from local #Cameras to global #Cameras.
-        C = len(viewmats)
+        print("Distributed not use")
 
     if with_ut:
         proj_results = fully_fused_projection_with_ut(

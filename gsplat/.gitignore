@@ -134,3 +134,5 @@ tests
 .clangd-template
 profiling
 dev
+
+SH_OUTPUTS

@@ -8,14 +8,28 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
 
+def _apply_colormap(x: np.ndarray, cmap: str = "magma") -> np.ndarray:
+    """
+    Apply a matplotlib-style colormap to a [H,W] float array in [0,1].
+    Returns [H, W, 3] uint8. Works without a display (SSH safe).
+    Uses only numpy — no plt.show() or GUI calls.
+    """
+    import matplotlib.cm as cm
+    mapper = cm.get_cmap(cmap)
+    rgba = mapper(x)                          # [H, W, 4] float64 in [0,1]
+    rgb  = (rgba[:, :, :3] * 255).astype(np.uint8)
+    return rgb
+
+    
 def spectral_angle_mapper(x, y, eps=1e-8):
     """
     Spectral Angle Mapper (SAM) metric.
     Args:
-        x, y: [..., C] — works for any leading dims (B,H,W,C) or (N,C) etc.
+        x, y works for any leading dims (B,H,W,BANDS)
     Returns:
         angle in radians [...] — mean over all pixels as scalar if reduce=True
     """
+
     # F.normalize is safer + faster than manual norm division
     # it handles zero vectors gracefully
     x_norm = F.normalize(x, p=2, dim=-1)  # [..., C]
@@ -23,8 +37,8 @@ def spectral_angle_mapper(x, y, eps=1e-8):
 
     # clamp is still needed for float precision at ±1
     cos = (x_norm * y_norm).sum(-1).clamp(-1.0 + eps, 1.0 - eps)
-
-    return torch.acos(cos)  # [...] radians
+    sam_map = torch.acos(cos) #radians
+    return sam_map.mean()
 
 import torch
 import numpy as np
@@ -98,6 +112,218 @@ def sam_metric(x, y, reduce=True):
     angle_deg = torch.rad2deg(angle)
     return angle_deg.mean() if reduce else angle_deg
 
+
+def spectral_kl_loss(
+    X_gt: torch.Tensor,     # (H, W, B)
+    X_pred: torch.Tensor,   # (H, W, B)
+    normalization: str = "l1",
+    eps: float = 1e-8,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Spectral KL divergence loss.
+
+    Computes:
+        KL(D_gt || D_pred)
+
+    after applying a spectral normalization strategy.
+
+    Args:
+        X_gt:
+            Ground-truth hyperspectral image (H, W, B)
+
+        X_pred:
+            Predicted hyperspectral image (H, W, B)
+
+        normalization:
+            Spectral normalization method:
+                - "softmax"
+                - "l1"
+                - "l2"
+
+        eps:
+            Numerical stability
+
+        reduction:
+            "mean" | "sum"
+
+    Returns:
+        Scalar spectral KL loss
+    """
+
+    # ------------------------------------------------------------------
+    # Spectral normalization
+    # ------------------------------------------------------------------
+
+    if normalization == "softmax":
+
+        # Probability distribution over wavelengths
+        D_gt = F.softmax(X_gt, dim=-1)
+        D_pred = F.softmax(X_pred, dim=-1)
+
+    elif normalization == "l1":
+
+        # Sum-to-one normalization
+        D_gt = X_gt / (X_gt.sum(dim=-1, keepdim=True) + eps)
+        D_pred = X_pred / (X_pred.sum(dim=-1, keepdim=True) + eps)
+
+    elif normalization == "l2":
+
+        # Unit spectral vector normalization
+        D_gt = F.normalize(X_gt, p=2, dim=-1, eps=eps)
+        D_pred = F.normalize(X_pred, p=2, dim=-1, eps=eps)
+
+        # KL requires positive values
+        D_gt = D_gt.abs()
+        D_pred = D_pred.abs()
+
+        # Renormalize to probability simplex
+        D_gt = D_gt / (D_gt.sum(dim=-1, keepdim=True) + eps)
+        D_pred = D_pred / (D_pred.sum(dim=-1, keepdim=True) + eps)
+
+    else:
+        raise ValueError(
+            f"Unknown normalization '{normalization}'. "
+            f"Choose from ['softmax', 'l1', 'l2']."
+        )
+
+    # ------------------------------------------------------------------
+    # KL divergence
+    # ------------------------------------------------------------------
+
+    log_D_pred = torch.log(D_pred + eps)
+
+    kl = F.kl_div(
+        log_D_pred,
+        D_gt,
+        reduction="none",
+        log_target=False,
+    )  # (H, W, B)
+
+    # Sum over spectral dimension
+    kl = kl.sum(dim=-1)  # (H, W)
+
+    # ------------------------------------------------------------------
+    # Reduction
+    # ------------------------------------------------------------------
+
+    if reduction == "mean":
+        return kl.mean()
+
+    elif reduction == "sum":
+        return kl.sum()
+
+    else:
+        raise ValueError(f"Invalid reduction: {reduction}")
+
+
+
+def spectral_sam_loss(
+    X_gt: torch.Tensor,     # (H, W, B)
+    X_pred: torch.Tensor,   # (H, W, B)
+    eps: float = 1e-8,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Spectral Angle Mapper (SAM) loss.
+
+    Measures spectral shape similarity independently of magnitude.
+
+    SAM(x, y) = arccos( <x,y> / (||x|| ||y||) )
+
+    Args:
+        X_gt:
+            Ground-truth hyperspectral image (H, W, B)
+
+        X_pred:
+            Predicted hyperspectral image (H, W, B)
+
+        eps:
+            Numerical stability
+
+        reduction:
+            "mean" | "sum"
+
+    Returns:
+        Scalar SAM loss in radians
+    """
+
+    # Dot product
+    dot = (X_gt * X_pred).sum(dim=-1)  # (H, W)
+
+    # Norms
+    norm_gt = torch.norm(X_gt, dim=-1).clamp(min=eps)
+    norm_pred = torch.norm(X_pred, dim=-1).clamp(min=eps)
+
+    # Cosine similarity
+    cos_theta = dot / (norm_gt * norm_pred)
+
+    # Numerical stability
+    cos_theta = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
+
+    # Spectral angle
+    sam = torch.acos(cos_theta)  # (H, W)
+
+    if reduction == "mean":
+        return sam.mean()
+
+    elif reduction == "sum":
+        return sam.sum()
+
+    else:
+        raise ValueError(f"Invalid reduction: {reduction}")
+
+def spectral_loss(
+    X_gt: torch.Tensor,    # (H, W, B) raw logits / raw spectral values GT
+    X_pred: torch.Tensor,  # (H, W, B) raw logits / raw spectral values predicted
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    L_spectral = α * Σ_{h,w} KL(D_gt || D_pred) + β * Σ_{h,w} (1 - cos(D_gt, D_pred))
+
+    D_λ(h,w) = softmax(X(h,w))  along the spectral (B) dimension.
+
+    Args:
+        X_gt   : (H, W, B) raw spectral values for ground truth
+        X_pred : (H, W, B) raw spectral values for prediction
+        alpha  : weight for KL divergence term
+        beta   : weight for cosine similarity term
+        eps    : numerical stability for cosine norm
+
+    Returns:
+        scalar loss tensor with gradients attached to X_pred
+    """
+    # ── 1. Normalize to probability distributions along spectral dim ──────────
+    D_gt   = F.softmax(X_gt,   dim=-1)   # (H, W, B)  — no grad needed
+    D_pred = F.softmax(X_pred, dim=-1)   # (H, W, B)  — gradients flow here
+
+    # ── 2. KL divergence: KL(D_gt || D_pred) = Σ_b D_gt * log(D_gt / D_pred) ─
+    # F.kl_div expects LOG-PROBABILITIES for the prediction
+    log_D_pred = torch.log(D_pred + eps)              # (H, W, B)
+    # reduction='none' → (H, W, B), then sum over spectral dim → (H, W)
+    kl_per_pixel = F.kl_div(
+        log_D_pred,
+        D_gt,
+        reduction="none",
+        log_target=False,
+    ).sum(dim=-1)                                      # (H, W)
+    kl_loss = kl_per_pixel.sum()                       # scalar Σ_{h,w}
+
+    # ── 3. Cosine similarity: (1 - cos(D_gt, D_pred)) per pixel ──────────────
+    # Both vectors are already positive (softmax), but we keep the general form.
+    dot      = (D_gt * D_pred).sum(dim=-1)             # (H, W)
+    norm_gt  = D_gt.norm(dim=-1).clamp(min=eps)        # (H, W)
+    norm_pred = D_pred.norm(dim=-1).clamp(min=eps)     # (H, W)
+    cosine_sim      = dot / (norm_gt * norm_pred)      # (H, W)  ∈ [-1, 1]
+    cosine_per_pixel = 1.0 - cosine_sim                # (H, W)
+    cosine_loss = cosine_per_pixel.sum()               # scalar Σ_{h,w}
+
+    # ── 4. Combined loss ──────────────────────────────────────────────────────
+    return alpha * kl_loss + beta * cosine_loss
+
+    
 class CameraOptModule(torch.nn.Module):
     """Camera pose optimization module."""
 
@@ -201,6 +427,127 @@ class AppearanceOptModule(torch.nn.Module):
             h = torch.cat([features, sh_bases], dim=-1)
         colors = self.color_head(h)
         return colors
+
+
+### Apperance Module V2
+
+
+### Wavelength Dependet Apperance Module
+
+
+
+
+class WavelengthEncoder(nn.Module):
+    """
+    Learns wavelength-specific offsets (δSH_λ) to add to base SH coefficients.
+
+    For each wavelength λ (normalized to [0,1]):
+      1. Positional embedding: γ(λ) = [sin(2^k π λ), cos(2^k π λ)] for k=0..L-1
+      2. MLP maps γ(λ) → δSH_λ  of shape (sh_coeffs,)
+      3. SH+_λ = SH_λ + δSH_λ   (broadcast over all N Gaussians)
+
+    Args:
+        sh_degree   : degree of spherical harmonics (3 → 16 coeffs, 4 → 25, etc.)
+        n_freq_bands: L in the paper, number of sinusoidal frequency bands
+        hidden_dim  : width of the MLP hidden layers
+    """
+
+    def __init__(self, sh_degree: int = 3, n_freq_bands: int = 8, hidden_dim: int = 64):
+        super().__init__()
+        self.sh_degree = sh_degree
+        self.n_freq_bands = n_freq_bands
+
+        # (degree+1)^2 SH coefficients per wavelength
+        self.n_sh_coeffs = (sh_degree + 1) ** 2  # 16 for degree 3
+
+        # Positional embedding output dim: sin + cos per band
+        pe_dim = 2 * n_freq_bands  # 16 for L=8
+
+        # MLP: γ(λ) → δSH_λ of shape (n_sh_coeffs,)
+        self.mlp = nn.Sequential(
+            nn.Linear(pe_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.n_sh_coeffs),
+        )
+
+        # Initialize last layer to near-zero so offsets start small
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+        # Register frequency bands as a buffer (not a learned param)
+        freqs = 2.0 ** torch.arange(n_freq_bands)  # [L]
+        self.register_buffer("freqs", freqs)
+
+    def positional_embedding(self, wavelengths: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            wavelengths: (B,) normalized wavelengths in [0, 1]
+        Returns:
+            γ(λ): (B, 2*L) sinusoidal embeddings
+        """
+        # (B, 1) * (L,) → (B, L)
+        angles = 2.0 * math.pi * wavelengths.unsqueeze(-1) * self.freqs
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)  # (B, 2L)
+
+    def forward(
+        self,
+        sh0: torch.Tensor,          # (N, 1, 3)  — DC SH band
+        shN: torch.Tensor,          # (N, K-1, 3) — higher SH bands
+        wavelengths: torch.Tensor,  # (B,) wavelength values, normalized [0,1]
+    ) -> torch.Tensor:
+        """
+        Returns SH+_λ for every Gaussian × wavelength combination.
+
+        Output shape: (N, B, K, 1)
+            N = number of Gaussians
+            B = number of wavelength bands
+            K = number of SH coefficients = (sh_degree+1)^2
+            last dim = 1  (monochromatic; hyperspectral replaces RGB)
+        """
+        N = sh0.shape[0]
+        B = wavelengths.shape[0]
+        K = self.n_sh_coeffs
+
+        # --- 1. Build base SH: (N, K, 3) → collapse RGB to scalar per band ---
+        # In hyperspectral 3DGS each wavelength IS a channel, so we use
+        # a single scalar SH coefficient set.  We average RGB as a simple
+        # bridge; in a full hyperspectral implementation sh would be (N, K, B).
+        sh_base = torch.cat([sh0, shN], dim=1)  # (N, K, B)
+        sh_scalar = sh_base.mean(dim=-1)         # (N, K)  — one value per coeff
+
+        # --- 2. Positional embedding for each wavelength ---
+        gamma = self.positional_embedding(wavelengths)  # (B, 2L)
+
+        # --- 3. MLP → per-wavelength offset ---
+        delta_sh = self.mlp(gamma)                      # (B, K)
+
+        # --- 4. Add offset (broadcast N and B) ---
+        # sh_scalar : (N, K) → (N, 1, K)
+        # delta_sh  : (B, K) → (1, B, K)
+        sh_plus = sh_scalar.unsqueeze(1) + delta_sh.unsqueeze(0)  # (N, B, K)
+
+        return sh_plus  # (N, B, K)
+
+
+# ─── Integration helper ──────────────────────────────────────────────────────
+
+def get_wavelength_modulated_colors(
+    splats: dict,
+    wavelength_encoder: WavelengthEncoder,
+    wavelengths: torch.Tensor,   # (B,) normalized wavelengths
+) -> torch.Tensor:
+    """
+    Drop-in replacement for the standard:
+        colors = torch.cat([splats["sh0"], splats["shN"]], dim=1)  # (N, K, 3)
+
+    Returns (N, B, K) — one SH set per Gaussian per wavelength band.
+    """
+    sh0 = splats["sh0"]   # (N, 1, 3)
+    shN = splats["shN"]   # (N, K-1, 3)
+    return wavelength_encoder(sh0, shN, wavelengths)  # (N, B, K)
+
 
 
 def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
@@ -313,155 +660,3 @@ def apply_depth_colormap(
     return img
 
 
-import os
-import numpy as np
-import cv2
-import argparse
-
-# XYZ from chromaticity helper
-def xyz_from_xy(x,y):
-    return np.array((x,y,1-x-y))
-
-ILUMINANT = {
-    'D65': xyz_from_xy(0.3127, 0.3291),
-    'E':  xyz_from_xy(1/3, 1/3),
-}
-
-COLOR_SPACE = {
-    'sRGB': (xyz_from_xy(0.64, 0.33),
-             xyz_from_xy(0.30, 0.60),
-             xyz_from_xy(0.15, 0.06),
-             ILUMINANT['D65']),
-
-    'AdobeRGB': (xyz_from_xy(0.64, 0.33),
-                 xyz_from_xy(0.21, 0.71),
-                 xyz_from_xy(0.15, 0.06),
-                 ILUMINANT['D65']),
-
-    'AppleRGB': (xyz_from_xy(0.625, 0.34),
-                 xyz_from_xy(0.28, 0.595),
-                 xyz_from_xy(0.155, 0.07),
-                 ILUMINANT['D65']),
-
-    'UHDTV': (xyz_from_xy(0.708, 0.292),
-              xyz_from_xy(0.170, 0.797),
-              xyz_from_xy(0.131, 0.046),
-              ILUMINANT['D65']),
-
-    'CIERGB': (xyz_from_xy(0.7347, 0.2653),
-               xyz_from_xy(0.2738, 0.7174),
-               xyz_from_xy(0.1666, 0.0089),
-               ILUMINANT['E']),
-}
-
-
-# CIE Analytical CMF (Color Matching Function)
-
-def piecewise_gaussian(x,mu,tau1,tau2):
-    result = np.zeros_like(x) 
-    left_mask = x < mu
-    right_mask = x >= mu
-    result[left_mask] = np.exp((-0.5*tau1**2)*((x[left_mask]-mu)**2))
-    result[right_mask] = np.exp((-0.5*tau2**2)*((x[right_mask]-mu)**2))
-    return result
-
-
-def x_bar_1931(wavelength):
-    return (1.056 * piecewise_gaussian(wavelength, 599.8, 0.0264, 0.0323) +
-            0.362 * piecewise_gaussian(wavelength, 442.0, 0.0624, 0.0374) -
-            0.065 * piecewise_gaussian(wavelength, 501.1, 0.0490, 0.0382))
-
-def y_bar_1931(wavelength):
-    return (0.821 * piecewise_gaussian(wavelength, 568.8, 0.0213, 0.0247) +
-            0.286 * piecewise_gaussian(wavelength, 530.9, 0.0613, 0.0322))
-
-def z_bar_1931(wavelength):
-    return (1.217 * piecewise_gaussian(wavelength, 437.0, 0.0845, 0.0278) +
-            0.681 * piecewise_gaussian(wavelength, 459.0, 0.0385, 0.0725)) 
-
-def compute_cmf_1931(wavelength):
-    x_bar = x_bar_1931(wavelength) # shape (N,)
-    y_bar = y_bar_1931(wavelength)
-    z_bar = z_bar_1931(wavelength)
-    return np.stack([x_bar, y_bar, z_bar], axis=1) # shape (N,3) where N is the number of wavelengths (bands)
-
-
-
-class ColourSystem:
-
-    def __init__(self,start=450,end=650,bands=21, cspace='sRGB'):
-
-        wavelength = np.linspace(start,end,bands)
-
-        self.cmf = compute_cmf_1931(wavelength)
-
-        self.red, self.green, self.blue, self.white = COLOR_SPACE[cspace]
-
-        # The chromaticity matrix (rgb -> xyz) and its inverse
-        self.M = np.vstack((self.red, self.green, self.blue)).T
-        self.MI = np.linalg.inv(self.M)
-
-        # White scaling array
-        self.wscale = self.MI.dot(self.white)
-
-        # xyz -> rgb transformation matrix
-        self.A = self.MI / self.wscale[:, np.newaxis]
-
-        # Cache the transform matrix
-        self._transform = self._compute_transform()
-
-    def _compute_transform(self):
-            """spectrum (N, bands) -> rgb (N, 3), no cross-band normalization."""
-            XYZ = self.cmf           # (bands, 3)
-            RGB = XYZ @ self.A.T     # (bands, 3)
-            # Normalize so white spectrum maps to (1,1,1)
-            white_rgb = np.ones((1, XYZ.shape[0])) @ RGB  # sum over bands
-            RGB = RGB / white_rgb    # scale each channel
-            return RGB               # (bands, 3)
-
-    def spec_to_rgb(self, spec):
-        """Convert a spectrum to an rgb value."""
-        return spec @ self._transform  # (N, 3)
-    
-
-
-# Module-level cache
-_colour_system_cache = {}
-
-def spectrum_to_rgb(spectrum, start=450, end=650, bands=21, apply_gamma=True):
-    import torch
-
-    assert spectrum.shape[-1] == bands, \
-        f"Expected {bands} bands, got {spectrum.shape[-1]}"
-
-    is_torch = isinstance(spectrum, torch.Tensor)
-    device = spectrum.device if is_torch else None
-    dtype = spectrum.dtype if is_torch else None
-
-    spec_np = spectrum.detach().cpu().numpy() if is_torch else np.asarray(spectrum, dtype=np.float64)
-
-    original_shape = spec_np.shape
-    spec_2d = spec_np.reshape(-1, bands)
-
-    # Use cached ColourSystem
-    key = (start, end, bands)
-    if key not in _colour_system_cache:
-        _colour_system_cache[key] = ColourSystem(start=start, end=end, bands=bands)
-    cs = _colour_system_cache[key]
-
-    rgb_2d = cs.spec_to_rgb(spec_2d)
-    rgb_2d = np.clip(rgb_2d, 0, 1)
-
-    if apply_gamma:
-        rgb_2d = np.where(
-            rgb_2d < 0.0031308,
-            12.92 * rgb_2d,
-            1.055 * (rgb_2d ** (1.0 / 2.4)) - 0.055
-        )
-
-    rgb = rgb_2d.reshape(original_shape[:-1] + (3,))
-
-    if is_torch:
-        rgb = torch.from_numpy(rgb).to(device=device, dtype=dtype)
-
-    return rgb

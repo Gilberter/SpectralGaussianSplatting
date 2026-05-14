@@ -31,7 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, RootMeanSquaredErrorUsingSlidingWindow, SpectralAngleMapper
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, sam_metric, spectrum_to_rgb, compute_per_band_metrics
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, sam_metric, spectrum_to_rgb, compute_per_band_metrics, spectral_angle_mapper, _apply_colormap, WavelengthEncoder, get_wavelength_modulated_colors, spectral_loss
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -182,6 +182,12 @@ class Config:
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
 
+    ## Enable apperance optimization using positional embeddings for wavelength dependent apperance
+    wave_opt: bool = False
+    wave_embed_dim: int = 64
+    wave_opt_lr: float 1e-3
+    wave_opt_reg: float = 1e-6
+
     # Enable bilateral grid. (experimental)
     use_bilateral_grid: bool = False
     # Shape of the bilateral grid (X, Y, W)
@@ -199,6 +205,8 @@ class Config:
     # Temperature for softmax in KL loss (controls sharpness)
     kl_temperature: float = 1
 
+    sam_loss: bool = False
+
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Save training images to tensorboard
@@ -215,6 +223,34 @@ class Config:
 
     # just test True
     just_test: bool = False
+
+
+        feature_dim: int = 32
+
+    use_wandb: bool = True
+    wandb_project: str = "gsplat"
+    wandb_entity: str = "higilberter-universidad-industrial-de-santander"
+    wandb_run_name: Optional[str] = None
+    wandb_key = os.getenv('WANDB_API_KEY')
+    wandb_steps: int = 1000
+    wandb_path_challenge:str = ""
+
+    # max refine steps
+    max_refine_steps: int = 25000
+
+    noise_lr:float = 5e4 # default 5e5
+
+    min_opacity:float = 0.01 # Default 0.005
+
+    max_gaussians:int= 1_000_000
+
+    strategy_depth: Literal["None","progressive","cosine_warmup","exponential"] = "progressive"
+    depth_loss_to_compute: List[Literal["SSIL", "MSS"]] = field(default_factory=lambda: ["SSIL"])
+
+    ground_depth_loss: bool = False
+    ground_depth_lambda: float = 2.3
+    ground_seg_dir: str = ""
+    ground_depth_start_step: int = 1000
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -433,6 +469,7 @@ class Runner:
                 test_every=cfg.test_every,
             )
         else:
+            print("TRUE RGB")
             self.parser = HSIParser(
                 data_dir=cfg.hyperspectral_data_dir,
                 colmap_dir = cfg.colmap_dir,
@@ -449,12 +486,12 @@ class Runner:
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
         )
-
+        print("Dataset length:", len(self.trainset))
         self.valset = HyperspectralDataset(self.parser, split="val")
 
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
 
-        #print("Scene scale:", self.scene_scale)
+        print("Scene scale:", self.scene_scale)
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -562,6 +599,25 @@ class Runner:
                 self.app_module = DDP(self.app_module)
 
 
+        self.wave_optimizer = []
+        if cfg.wave_opt:
+
+            self.wave_module = WavelengthEncoder(
+                sh_degree = cfg.sh_degree, 
+                n_freq_bands = cfg.num_spectral_bands, 
+                hidden_dim = cfg.wave_embed_dim
+            ).to(self.device)
+            
+            self.wave_optimizer = [
+                # Positional-frequency spectral modulation MLP
+                torch.optim.Adam(
+                    self.wave_module.mlp.parameters(),
+                    lr=cfg.wave_opt_lr * math.sqrt(cfg.batch_size),
+                    weight_decay=cfg.wave_opt_reg,
+                ),
+            ]
+
+
         # BILATERAL GRID (Photometric Correction    )
 
         self.bil_grid_optimizers = []
@@ -662,20 +718,36 @@ class Runner:
         #print("colors shape", colors.shape)
         #  Appearance Optimization Module
         image_ids = kwargs.pop("image_ids", None)
-        # if self.cfg.app_opt:
-        #     colors = self.app_module(
-        #         features=self.splats["features"],
-        #         embed_ids=image_ids,
-        #         dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
-        #         sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
-        #     )
-        #     colors = colors + self.splats["colors"]
-        #     colors = torch.sigmoid(colors)
-        # else:
-        #     # Classic GS
-        #     # sh0 is the base color rgb Shape [N,1,3]
-        #     # shN view dependent [N,K-1,3]
-        #     colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+        if self.cfg.app_opt:
+            colors = self.app_module(
+                features=self.splats["features"],
+                embed_ids=image_ids,
+                dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
+                sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
+            )
+            colors = colors + self.splats["colors"]
+            colors = torch.sigmoid(colors)
+        else:
+            # Classic GS
+            # sh0 is the base color rgb Shape [N,1,3]
+            # shN view dependent [N,K-1,3]
+            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+
+
+        if self.cfg.wave_opt:
+            # have in mind that this is not generazible, we can do it generazible
+            wavelengths = torch.linspace(
+                450.0,
+                650.0,
+                cfg.num_spectral_bands,
+                device=self.splats["sh0"].device,
+            )
+
+            # Normalize to [0,1]
+            wavelengths = (wavelengths - 450.0) / (650.0 - 450.0)
+            delta_sh = self.wave_module(sh0=self.splats['sh0'],shN=self.splats['shN'],wavelengths=wavelengths)
+            colors = colors + delta_sh
+            colors = torch.sigmoid(colors)
 
         # Rasterization Mode
         # Classic faster,harder edges
@@ -844,9 +916,13 @@ class Runner:
             # start with low frequency color
             # gradually add high frequency SH
             if cfg.sh_hyperspectral or cfg.sh_degree is not None:
+                
+
                 sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+
             else:
                 sh_degree_to_use = None
+            print(f"cfg.sh_degree {cfg.sh_degree} sh_degree_to_use {sh_degree_to_use}")
             # forward
             # the rendering
             self.sh_degree_to_use = sh_degree_to_use
@@ -921,9 +997,13 @@ class Runner:
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
+            samloss = None
+            if cfg.sam_loss:
+
+                samloss = spectral_angle_mapper(colors,pixels) 
             
             # Photometric loss (L1 + SSIM)
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda 
 
             # add the loss from the paper Diffusion Denoised HSI
             
@@ -931,16 +1011,15 @@ class Runner:
             klloss = None
             if cfg.kl_loss:
                 
-                # Normalize spectral distributions for KL divergence
-                # Ensure non-negative and sum to 1 along spectral dimension
-                log_colors = F.log_softmax(colors / cfg.kl_temperature, dim=-1)
-                pixels_prob  = F.softmax(pixels / cfg.kl_temperature, dim=-1)
-                
-                # KL divergence: D_KL(P||Q) = sum(P * log(P/Q))                
-                klloss = F.kl_div(log_colors,pixels_prob,reduction="batchmean")
-                loss += klloss * cfg.kl_lambda
+                klloss = spectral_loss(colors,pixels)
             
+            if cfg.sam_loss:
+                loss += samloss * 1e-3
             # OPTIONAL DEPTH LOSS
+
+            if cfg.kl_loss:
+                loss += klloss * kl_lambda
+
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -976,7 +1055,7 @@ class Runner:
 
             loss.backward() # backward pass
 
-            desc = f"loss={loss.item():.3f}| ssim= {ssimloss} l1loss = {l1loss}"
+            desc = f"loss={loss.item():.3f}| ssim= {ssimloss} l1loss = {l1loss} "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.kl_loss and klloss is not None:
@@ -985,6 +1064,8 @@ class Runner:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
+            if cfg.sam_loss:
+                desc += f"sam loss={samloss}"
             pbar.set_description(desc)
 
             # write images (gt and render)
@@ -1022,9 +1103,9 @@ class Runner:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 stats = {
                     "mem": mem,
-                    "ellipse_time": time.time() - global_tic,
+                    "ellipse_time": (time.time() - global_tic),
                     "num_GS": len(self.splats["means"]),
-                    "Global Time": global_tic,
+                    "Global Time": global_tic ,
                     "sh_degree": self.sh_degree_to_use
                 }
                 #print("Step: ", step, stats)
@@ -1157,6 +1238,9 @@ class Runner:
             for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.wave_optimizer:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -1221,8 +1305,10 @@ class Runner:
             self.valset, batch_size=1, shuffle=False, num_workers=0
         )
         ellipse_time = 0
-        metrics = defaultdict(list)
-        metric_wavelength = defaultdict(list)
+        # Separate metric buckets
+        metrics_hsi  = defaultdict(list)   # SAM, per-band PSNR/RMSE/MSE
+        metrics_rgb  = defaultdict(list)   # LPIPS (needs RGB)
+        metrics_full = defaultdict(list)   # PSNR, SSIM, RMSE on full spectral/rgb tensor
         #print(f"device {device} world rank {world_rank} world size {world_size}")
         
         for i, data in enumerate(valloader):
@@ -1231,7 +1317,7 @@ class Runner:
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) 
             #print(f"pixels lowest value {pixels.min()} greates {pixels.max()}")
-            #print(f"pixels image shape {pixels.shape}")
+            print(f"pixels image shape {pixels.shape}")
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
@@ -1250,117 +1336,238 @@ class Runner:
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
-            colors = torch.clamp(colors, 0.0, 1.0)
+            #print(f"Colors pree clamp min {colors.min()} max {colors.max()} dtype {colors.dtype}")
+            mask = masks.detach().cpu().permute(1,2,0)
 
             if world_rank == 0:
                 # FOR HSI USING THE FUNCTION SPECTRUM_TO_RGB
 
+                
+
+                
+                # print(f"Pixel device {pixels.device} Colors Device {colors.device}")
+                # print(f"Pixel cpu device {pixels_cpu.device} Colors cpu Device {colors_cpu.device}")
+
+                # print(f"Pixels datatype {pixels.dtype}  Colors dtype {colors.dtype}")
+                # print(f"Where is NaN pixels {torch.isnan(pixels).sum()} Where is NaN colors {torch.isnan(colors).sum()}")
+                 
+                
+                # print(f"Normalization of the pixels firm")
+                # print(f"Pixels only positive values min {pixels.min()} max {pixels.max()}  Colors min {colors.min()} Colors max {colors.max()}")
+                # print(f"Pixels datatype {pixels.dtype}  Colors dtype {colors.dtype}")
+                # print(f"Where is NaN pixels {torch.isnan(pixels).sum()} Where is NaN colors {torch.isnan(colors).sum()}")
+                
+                #print(f"Pixels only positive values min {pixels.min()} max {pixels.max()}  Colors min {colors.min()} Colors max {colors.max()}")
+
+                if pixels.max() > 1:
+                    pixels = pixels / pixels.max().clamp(min=1e-8)
+                    pixels = torch.clamp(pixels,0.0,1.0)
+                    #print(f"Pixels only positive values min {pixels.min()} max {pixels.max()}  Colors min {colors.min()} Colors max {colors.max()}")
+
+                if colors.max() > 1:
+                    colors = colors / colors.max().clamp(min=1e-8)
+                    colors = torch.clamp(colors,0.0,1.0)
+                    
+                colors = torch.clamp(colors,0.0,1.0)
+
                 pixels_cpu = pixels.detach().cpu()
                 colors_cpu = colors.detach().cpu()
+
+                pixels_t = pixels.permute(0, 3, 1, 2)
+                colors_t = colors.permute(0,3,1,2)
+
+                mask_hw1 = masks.detach().cpu().permute(1, 2, 0).float() if masks is not None else torch.ones(height, width, 1)
+
                 # Write images}
                 if self.cfg.use_hyperspectral:
-                    pixels_rgb = spectrum_to_rgb(pixels_cpu, start=450, end=650, bands=cfg.num_spectral_bands)
-                    colors_rgb = spectrum_to_rgb(colors_cpu, start=450, end=650, bands=cfg.num_spectral_bands)
-                    canvas = torch.cat([pixels_rgb, colors_rgb], dim=2).squeeze(0).numpy()  # [H, W*2, 3]
-                    canvas = (canvas * 255).astype(np.uint8)
-                    imageio.imwrite(
-                        f"{self.render_dir}/{stage}_step{step}_hsi(rgb){i:04d}.png",
-                        canvas,
-                    )
-                    colors_rgb = colors_rgb.permute(0, 3, 1, 2).to(colors.device)  # [1, 3, H, W]
-                    pixels_rgb = pixels_rgb.permute(0, 3, 1, 2).to(pixels.device)  # [1, 3, H, W]
 
-                    colors_t = colors.permute(0, 3, 1, 2).to(colors.device) # [1, Bands, H, W]
-                    pixels_t = pixels.permute(0, 3, 1, 2).to(pixels.device)  # [1, Bands, H, W]
+                    
 
-                    mask = masks.reshape(1, 1, colors_t.shape[-2], colors_t.shape[-1])
+                    pixels_rgb = spectrum_to_rgb(pixels_cpu, start=450, end=650, bands=cfg.num_spectral_bands)  # [1,H,W,3]
+                    colors_rgb = spectrum_to_rgb(colors_cpu, start=450, end=650, bands=cfg.num_spectral_bands)  # [1,H,W,3]
 
-                    metrics["lpips"].append(self.lpips(colors_rgb, pixels_rgb))  # RGB only
-                    psnr_per_band, rmse_per_band, mse_per_band = (compute_per_band_metrics(colors_t, pixels_t, masks))
-                    psnr_per_band, rmse_per_band, mse_per_band = psnr_per_band.detach().cpu().numpy().tolist(), rmse_per_band.detach().cpu().numpy().tolist(), mse_per_band.detach().cpu().numpy().tolist()
-                    metric_wavelength["psnr_per_band"].append(psnr_per_band)
-                    metric_wavelength["rmse_per_band"].append(rmse_per_band)
-                    metric_wavelength["mse_per_band"].append(mse_per_band)
-                    sam_metric = (self.sam(colors_t*mask, pixels_t*mask))
-                    if sam_metric is not None:
-                        metrics["sam"].append(sam_metric)
-                    else:
-                        metrics["sam"].append(torch.zeros(0) )
+                    canvas_rgb = torch.cat([pixels_rgb, colors_rgb], dim=2).squeeze(0).numpy()
+                    canvas_rgb = (np.clip(canvas_rgb, 0, 1) * 255).astype(np.uint8)
+                    imageio.imwrite(f"{self.render_dir}/{stage}_step{step:04d}_{i:04d}_rgb.png", canvas_rgb)
+
+                    # RGB with mask applied (shows only valid region)
+                    pixels_rgb_masked = spectrum_to_rgb(pixels_cpu.squeeze(0) * mask_hw1, start=450, end=650, bands=cfg.num_spectral_bands)
+                    colors_rgb_masked = spectrum_to_rgb(colors_cpu.squeeze(0) * mask_hw1, start=450, end=650, bands=cfg.num_spectral_bands)
+                    canvas_masked = np.concatenate([
+                        (np.clip(pixels_rgb_masked.numpy(), 0, 1) * 255).astype(np.uint8),
+                        (np.clip(colors_rgb_masked.numpy(), 0, 1) * 255).astype(np.uint8),
+                    ], axis=1)
+                    imageio.imwrite(f"{self.render_dir}/{stage}_step{step:04d}_{i:04d}_rgb_masked.png", canvas_masked)
+                    
+                    B = colors_cpu.shape[-1]
+                    band_indices = {
+                        "band_short": 0,
+                        "band_mid":   B // 2,
+                        "band_long":  B - 1,
+                    }
+                    for band_name, b_idx in band_indices.items():
+                        # Apply colormap (MAGMA: dark=low, bright=high reflectance)
+                        gt_band   = pixels_cpu[0, :, :, b_idx].numpy()   # [H, W]
+                        rend_band = colors_cpu[0, :, :, b_idx].numpy()   # [H, W]
+
+                        gt_cm   = _apply_colormap(gt_band,   cmap="magma")   # [H, W, 3] uint8
+                        rend_cm = _apply_colormap(rend_band, cmap="magma")   # [H, W, 3] uint8
+
+                        # Error map (absolute difference, viridis: 0=purple, high=yellow)
+                        err = np.abs(gt_band - rend_band)
+                        err_cm = _apply_colormap(err / (err.max() + 1e-8), cmap="viridis")
+
+                        canvas_band = np.concatenate([gt_cm, rend_cm, err_cm], axis=1)  # side by side
+                        imageio.imwrite(
+                            f"{self.render_dir}/{stage}_step{step:04d}_{i:04d}_{band_name}.png",
+                            canvas_band,
+                        )
+                
+                else:
+                    canvas_rgb = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
+                    canvas_rgb = (np.clip(canvas_rgb, 0, 1) * 255).astype(np.uint8)
+                    imageio.imwrite(f"{self.render_dir}/{stage}_step{step:04d}_{i:04d}_rgb.png", canvas_rgb)
+                    
+     
+                # depth map with turbo blue far red near
+                renders_depth, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    render_mode="RGB+D",
+                )
+                depth = renders_depth[0, :, :, -1].detach().cpu().numpy()   # [H, W]
+                depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+                depth_cm = _apply_colormap(depth_norm, cmap="turbo")         # blue=far red=near
+                imageio.imwrite(f"{self.render_dir}/{stage}_step{step:04d}_{i:04d}_depth.png", depth_cm)
+                # Metrics
+                if cfg.use_hyperspectral:
+                    pixels_sam = F.normalize(pixels, p=2, dim=-1, eps=1e-12)
+                    pixels_sam = torch.clamp(pixels_sam,0.0,1.0).permute(0, 3, 1, 2)
+
+                    colors_sam = F.normalize(colors, p=2, dim=-1, eps=1e-8)
+                    colors_sam = torch.clamp(colors_sam,0.0,1.0).permute(0, 3, 1, 2)
+
+                    # RGB-space metrics (need [1,3,H,W])
+                    colors_rgb_chw = colors_rgb.permute(0, 3, 1, 2).to(device)
+                    pixels_rgb_chw = pixels_rgb.permute(0, 3, 1, 2).to(device)
+                    metrics_rgb["lpips"].append(self.lpips(colors_rgb_chw, pixels_rgb_chw))
+
+                    # Per-band metrics
+                    psnr_pb, rmse_pb, mse_pb = compute_per_band_metrics(colors_t, pixels_t, masks)
+                    metrics_hsi["psnr_per_band"].append(psnr_pb.detach().cpu().numpy().tolist())
+                    metrics_hsi["rmse_per_band"].append(rmse_pb.detach().cpu().numpy().tolist())
+                    metrics_hsi["mse_per_band"].append(mse_pb.detach().cpu().numpy().tolist())
+
+                    # SAM 
+                    metrics_hsi["sam"].append(self.sam(colors_sam + 1e-8, pixels_sam + 1e-8))
+
+                    # Full-tensor metrics
+                    metrics_full["psnr"].append(self.psnr(colors_t, pixels_t))
+                    metrics_full["ssim"].append(self.ssim(colors_t, pixels_t))
+                    metrics_full["rmse"].append(self.rmse(colors_t, pixels_t))
 
                 else:
-                
-                    canvas_list = [pixels, colors]
-                    canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                    canvas = (canvas * 255).astype(np.uint8)
-                    imageio.imwrite(
-                        f"{self.render_dir}/{stage}_step{step}_rgb{i:04d}.png",
-                        canvas,
-                    )
+                    print(f"COLORS SHAPE {colors_t.shape} {pixels_t.shape}")
+                    metrics_rgb["lpips"].append(self.lpips(colors_t, pixels_t))
                     
-                    colors_t = colors.permute(0, 3, 1, 2).to(colors.device) # [1, 3, H, W]
-                    pixels_t = pixels.permute(0, 3, 1, 2).to(pixels.device)   # [1, 3, H, W]
-                    metrics["lpips"].append(self.lpips(colors_t, pixels_t))  # RGB only
-                    metric_wavelength["psnr_per_band"].append(0)
-                    metric_wavelength["rmse_per_band"].append(0)
-                    metric_wavelength["mse_per_band"].append(0)
-                    metrics["sam"].append(torch.zeros(0) )
+                    metrics_full["psnr"].append(self.psnr(colors_t, pixels_t))
+                    metrics_full["ssim"].append(self.ssim(colors_t, pixels_t))
+                    metrics_full["rmse"].append(self.rmse(colors_t, pixels_t))
+                    #metrics_hsi["sam"].append(None)
+                    print(f"Pixels only positive values min {pixels.min()} max {pixels.max()}  Colors min {colors.min()} Colors max {colors.max()}")
+                    print(f"Pixels shape {pixels.shape} Colors shape {colors.shape}")
 
-                ##print(f"pixels_rgb shape {pixels_rgb.shape}")
-                ##print(f"colors rgb shape {colors_rgb.shape}")
-                
-                # rendered_np = colors.squeeze(0).cpu().numpy()  # [H, W, B]
-                # npy_dir = f"{self.render_dir}/npy"
-                # os.makedirs(npy_dir, exist_ok=True)
-                #np.save(f"{npy_dir}/{stage}_step{step}_{i:04d}_render.npy", colors_np)
-
-                # LPIPS expects [N, 3, H, W] normalized to [-1, 1] or [0, 1] depending on impl
-                # Convert RGB [1, H, W, 3] -> [1, 3, H, W]
-                
-
-                metrics["psnr"].append(self.psnr(colors_t, pixels_t))
-                metrics["ssim"].append(self.ssim(colors_t, pixels_t))
-                metrics["rmse"].append(self.rmse(colors_t,pixels_t))
-                ##print("stucker after metrics?")
-
+                    print(metrics_rgb["lpips"])
+                    print(metrics_full["psnr"])
+                    print(metrics_full["ssim"])
+                    print(metrics_full["rmse"])
+                    print(metrics_hsi["sam"])
         if world_rank == 0:
-            if len(valloader) > 0:
-                #print("yes valloader")
-                ellipse_time /= len(valloader)
-            else:
-                print("wtf")
-            stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
-            stats.update(
-                {
+             # ── Aggregate metrics ─────────────────────────────────────────
+            def _mean(lst):
+                lst = [x for x in lst if x is not None]
+
+                if len(lst) == 0:
+                    return 0
+
+                v = lst[0]
+
+                if isinstance(v, torch.Tensor):
+                    return torch.stack(lst).mean().item()
+
+                if isinstance(v, (float, int)):
+                    return float(np.mean(lst))
+
+                arr = np.array(lst)
+                return arr.mean(axis=0).tolist()
+            ellipse_time /= max(len(valloader), 1)
+            stats = {
+                "meta": {
+                    "step":         step,
+                    "stage":        stage,
+                    "num_GS":       len(self.splats["means"]),
+                    "sh_degree":    self.sh_degree_to_use,
                     "ellipse_time": ellipse_time,
-                    "num_GS": len(self.splats["means"]),
-                    "sh_degree": self.sh_degree_to_use
-                }
-            )
-            if cfg.use_bilateral_grid:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            else:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"SAM: no "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            combined_stats = {
-                **stats,  # Unpack the first dict
-                "wavelength_metrics": metric_wavelength  # Add the second as a nested field
+                    "mode":         "hyperspectral" if cfg.use_hyperspectral else "rgb",
+                },
+                "metrics_spectral": {
+                    "psnr":  _mean(metrics_full["psnr"]),
+                    "ssim":  _mean(metrics_full["ssim"]),
+                    "rmse":  _mean(metrics_full["rmse"]),
+                    "sam":   _mean(metrics_hsi.get("sam", [])),
+                },
+                "metrics_rgb": {
+                    "lpips": _mean(metrics_rgb["lpips"]),
+                    "note":  "Computed on CIE-converted RGB image" if cfg.use_hyperspectral else "Direct RGB",
+                },
+                "metrics_per_band": {
+                    "psnr_per_band": _mean(metrics_hsi.get("psnr_per_band", [])),
+                    "rmse_per_band": _mean(metrics_hsi.get("rmse_per_band", [])),
+                    "mse_per_band":  _mean(metrics_hsi.get("mse_per_band",  [])),
+                    "wavelengths_nm": np.linspace(450, 650, cfg.num_spectral_bands).tolist()
+                        if cfg.use_hyperspectral else None,
+                },
             }
+            # ── Print summary ─────────────────────────────────────────────
+            ms = stats["metrics_spectral"]
+            mr = stats["metrics_rgb"]
+            print(
+                f"\n{'='*60}\n"
+                f"  Eval  step={step:05d}  stage={stage}\n"
+                f"{'='*60}\n"
+                f"  PSNR : {ms['psnr']:.3f} dB\n"
+                f"  SSIM : {ms['ssim']:.4f}\n"
+                f"  RMSE : {ms['rmse']:.4f}\n"
+                f"  SAM  : {ms['sam']:.4f} rad\n"
+                f"  LPIPS: {mr['lpips']:.4f}  ({mr['note']})\n"
+                f"  Time : {ellipse_time:.3f} s/image\n"
+                f"  GS   : {stats['meta']['num_GS']}\n"
+                f"{'='*60}\n"
+            )
+
+            with open(f"{self.stats_dir}/{stage}_step{step:04d}_metrics.json", "w") as f:
+                json.dump(stats, f, indent=2)
+            # if cfg.use_bilateral_grid:
+            #     print(
+            #         f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+            #         f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
+            #         f"Time: {stats['ellipse_time']:.3f}s/image "
+            #         f"Number of GS: {stats['num_GS']}"
+            #     )
+            # else:
+            #     print(
+            #         f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+            #         f"Time: {stats['ellipse_time']:.3f}s/image "
+            #         f"SAM: {stats['sam']}"
+            #         f"Number of GS: {stats['num_GS']}"
+            #     )
+            
             # save stats as json
-            with open(f"{self.stats_dir}/{stage}_step_eval_metrics_{step:04d}.json", "w") as f:
-                json.dump(combined_stats, f)
-            # # save stats to tensorboard
-            # for k, v in stats.items():
-            #     self.writer.add_scalar(f"{stage}/{k}", v, step)
-            # self.writer.flush()
+          
 
     @torch.no_grad()
     def render_traj(self, step: int):
@@ -1370,8 +1577,11 @@ class Runner:
         #print("Running trajectory rendering...")
         cfg = self.cfg
         device = self.device
-
+        #print(f"CAMTOWORLS {self.parser.camtoworlds}")
+        
         camtoworlds_all = self.parser.camtoworlds[5:-5]
+        if camtoworlds_all.shape[0] < 2:
+            return
         if cfg.render_traj_path == "interp":
             camtoworlds_all = generate_interpolated_path(
                 camtoworlds_all, 1

@@ -238,6 +238,10 @@ def generate_interpolated_path(
 
     def interp(points, n, k, s):
         """Runs multidimensional B-spline interpolation on the input points."""
+        print(points.shape)
+        print(n,k,s)
+        if points.shape[0] == 0:
+            points = points.squeeze(0)
         sh = points.shape
         pts = np.reshape(points, (sh[0], -1))
         k = min(k, sh[0] - 1)

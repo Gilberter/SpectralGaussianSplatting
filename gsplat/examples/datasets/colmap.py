@@ -515,12 +515,6 @@ class HSIParser:
         self.normalize = normalize
         self.test_every = test_every
 
-        if colmap_dir == "":
-            colmap_dir = os.path.join(data_dir, "sparse/0/")
-        
-        # Find COLMAP directory
-        if not os.path.exists(colmap_dir):
-            colmap_dir = os.path.join(colmap_dir, "sparse/0/")
         assert os.path.exists(
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
@@ -803,7 +797,7 @@ class HyperspectralDataset:
             normalize_bands: Whether to normalize each band to [0, 1]
         """
         self.parser = parser
-        self.npy_dir = os.path.join(parser.data_dir)
+        self.npy_dir = parser.data_dir
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
@@ -867,6 +861,7 @@ class HyperspectralDataset:
 
     def _get_npy_path(self, image_name: str) -> Optional[str]:
         """Get .npy file path for an image name."""
+        
         return self.npy_mapping.get(image_name)
 
     def __len__(self):
@@ -875,9 +870,10 @@ class HyperspectralDataset:
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
         image_name = self.parser.image_names[index]
-
+        print("NPY PATH IMAGE NAME ",image_name)
         # Load hyperspectral data from .npy file
         npy_path = self._get_npy_path(image_name)
+        print("NPY PATH ",npy_path)
         if not npy_path:
             raise FileNotFoundError(
                 f"Cannot find .npy file for image: {image_name}"
