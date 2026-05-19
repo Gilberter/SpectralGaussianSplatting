@@ -7,6 +7,8 @@ from torch import Tensor
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
+import torch.nn as nn
+import math
 
 def _apply_colormap(x: np.ndarray, cmap: str = "magma") -> np.ndarray:
     """
@@ -112,7 +114,6 @@ def sam_metric(x, y, reduce=True):
     angle_deg = torch.rad2deg(angle)
     return angle_deg.mean() if reduce else angle_deg
 
-
 def spectral_kl_loss(
     X_gt: torch.Tensor,     # (H, W, B)
     X_pred: torch.Tensor,   # (H, W, B)
@@ -120,78 +121,46 @@ def spectral_kl_loss(
     eps: float = 1e-8,
     reduction: str = "mean",
 ) -> torch.Tensor:
-    """
-    Spectral KL divergence loss.
+    
 
-    Computes:
-        KL(D_gt || D_pred)
+    if X_gt.shape[0] == 1:
+        X_gt = X_gt.squeeze(0)
+        X_pred = X_pred.squeeze(0)
 
-    after applying a spectral normalization strategy.
 
-    Args:
-        X_gt:
-            Ground-truth hyperspectral image (H, W, B)
-
-        X_pred:
-            Predicted hyperspectral image (H, W, B)
-
-        normalization:
-            Spectral normalization method:
-                - "softmax"
-                - "l1"
-                - "l2"
-
-        eps:
-            Numerical stability
-
-        reduction:
-            "mean" | "sum"
-
-    Returns:
-        Scalar spectral KL loss
-    """
+    # 🛑 Crucial: Force non-negativity for physical spectrum scaling
+    if normalization in ["l1", "l2"]:
+        X_gt = torch.clamp(X_gt, min=0.0)
+        X_pred = torch.clamp(X_pred, min=0.0)
 
     # ------------------------------------------------------------------
     # Spectral normalization
     # ------------------------------------------------------------------
-
     if normalization == "softmax":
-
-        # Probability distribution over wavelengths
         D_gt = F.softmax(X_gt, dim=-1)
         D_pred = F.softmax(X_pred, dim=-1)
 
     elif normalization == "l1":
-
         # Sum-to-one normalization
         D_gt = X_gt / (X_gt.sum(dim=-1, keepdim=True) + eps)
         D_pred = X_pred / (X_pred.sum(dim=-1, keepdim=True) + eps)
 
     elif normalization == "l2":
-
         # Unit spectral vector normalization
         D_gt = F.normalize(X_gt, p=2, dim=-1, eps=eps)
         D_pred = F.normalize(X_pred, p=2, dim=-1, eps=eps)
 
-        # KL requires positive values
-        D_gt = D_gt.abs()
-        D_pred = D_pred.abs()
-
         # Renormalize to probability simplex
         D_gt = D_gt / (D_gt.sum(dim=-1, keepdim=True) + eps)
         D_pred = D_pred / (D_pred.sum(dim=-1, keepdim=True) + eps)
-
     else:
-        raise ValueError(
-            f"Unknown normalization '{normalization}'. "
-            f"Choose from ['softmax', 'l1', 'l2']."
-        )
+        raise ValueError(f"Unknown normalization '{normalization}'.")
 
     # ------------------------------------------------------------------
-    # KL divergence
+    # Safe KL divergence calculation
     # ------------------------------------------------------------------
-
-    log_D_pred = torch.log(D_pred + eps)
+    # Add eps to both to guarantee target > 0 and pred > 0
+    log_D_pred = torch.log(D_pred.clamp(min=eps))
 
     kl = F.kl_div(
         log_D_pred,
@@ -206,13 +175,10 @@ def spectral_kl_loss(
     # ------------------------------------------------------------------
     # Reduction
     # ------------------------------------------------------------------
-
     if reduction == "mean":
         return kl.mean()
-
     elif reduction == "sum":
         return kl.sum()
-
     else:
         raise ValueError(f"Invalid reduction: {reduction}")
 
@@ -223,6 +189,8 @@ def spectral_sam_loss(
     X_pred: torch.Tensor,   # (H, W, B)
     eps: float = 1e-8,
     reduction: str = "mean",
+    ignore_dark_pixels:bool = True, # mask out near-zero pixels where SAM is undefined
+    dark_threshold: float = 1e-4,   # pixels with gt norm below this are ignored
 ) -> torch.Tensor:
     """
     Spectral Angle Mapper (SAM) loss.
@@ -248,6 +216,11 @@ def spectral_sam_loss(
         Scalar SAM loss in radians
     """
 
+    if X_gt.shape[0] == 1:
+        X_gt   = X_gt.squeeze(0)
+        X_pred = X_pred.squeeze(0)
+
+
     # Dot product
     dot = (X_gt * X_pred).sum(dim=-1)  # (H, W)
 
@@ -256,7 +229,7 @@ def spectral_sam_loss(
     norm_pred = torch.norm(X_pred, dim=-1).clamp(min=eps)
 
     # Cosine similarity
-    cos_theta = dot / (norm_gt * norm_pred)
+    cos_theta = dot / (norm_gt * norm_pred).clamp(min=1e-8)
 
     # Numerical stability
     cos_theta = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
@@ -264,14 +237,28 @@ def spectral_sam_loss(
     # Spectral angle
     sam = torch.acos(cos_theta)  # (H, W)
 
+
+    if ignore_dark_pixels:
+        valid = norm_gt > dark_threshold   # (...,)  True where gt is non-dark
+        if reduction == "mean":
+            # Avoid division by zero if all pixels are dark (edge case)
+            n_valid = valid.sum().clamp(min=1)
+            return (sam * valid).sum() / n_valid
+        elif reduction == "sum":
+            return (sam * valid).sum()
+        elif reduction == "none":
+            return sam * valid
+        else:
+            raise ValueError(f"Invalid reduction '{reduction}'.")
+
     if reduction == "mean":
         return sam.mean()
-
     elif reduction == "sum":
         return sam.sum()
-
+    elif reduction == "none":
+        return sam
     else:
-        raise ValueError(f"Invalid reduction: {reduction}")
+        raise ValueError(f"Invalid reduction '{reduction}'.")
 
 def spectral_loss(
     X_gt: torch.Tensor,    # (H, W, B) raw logits / raw spectral values GT
@@ -493,42 +480,54 @@ class WavelengthEncoder(nn.Module):
 
     def forward(
         self,
-        sh0: torch.Tensor,          # (N, 1, 3)  — DC SH band
-        shN: torch.Tensor,          # (N, K-1, 3) — higher SH bands
-        wavelengths: torch.Tensor,  # (B,) wavelength values, normalized [0,1]
+        sh0: torch.Tensor,           # (N, 1, C)   DC SH band
+        shN: torch.Tensor,           # (N, K-1, C) higher SH bands
+        wavelengths: torch.Tensor,   # (C,) normalized wavelengths in [0, 1]
     ) -> torch.Tensor:
         """
-        Returns SH+_λ for every Gaussian × wavelength combination.
+        Compute per-channel SH offsets and add them to the base SH coefficients.
 
-        Output shape: (N, B, K, 1)
-            N = number of Gaussians
-            B = number of wavelength bands
-            K = number of SH coefficients = (sh_degree+1)^2
-            last dim = 1  (monochromatic; hyperspectral replaces RGB)
+        C is 3 for RGB, or num_spectral_bands for HSI.
+
+        The MLP sees each wavelength independently and outputs K scalar offsets.
+        Those offsets are broadcast over N Gaussians, then applied per channel.
+
+        Args:
+            sh0         : (N, 1, C)
+            shN         : (N, K-1, C)
+            wavelengths : (C,) one normalized wavelength per channel
+
+        Returns:
+            (N, K, C)  — same shape as torch.cat([sh0, shN], dim=1)
         """
-        N = sh0.shape[0]
-        B = wavelengths.shape[0]
-        K = self.n_sh_coeffs
+        # sh_base: (N, K, C)
+        sh_base = torch.cat([sh0, shN], dim=1)
+        N, K, C = sh_base.shape
 
-        # --- 1. Build base SH: (N, K, 3) → collapse RGB to scalar per band ---
-        # In hyperspectral 3DGS each wavelength IS a channel, so we use
-        # a single scalar SH coefficient set.  We average RGB as a simple
-        # bridge; in a full hyperspectral implementation sh would be (N, K, B).
-        sh_base = torch.cat([sh0, shN], dim=1)  # (N, K, B)
-        sh_scalar = sh_base.mean(dim=-1)         # (N, K)  — one value per coeff
+        assert K == self.n_sh_coeffs, (
+            f"Expected {self.n_sh_coeffs} SH coeffs (sh_degree={self.sh_degree}), "
+            f"got {K}. Check that sh_degree matches the splat tensors."
+        )
 
-        # --- 2. Positional embedding for each wavelength ---
-        gamma = self.positional_embedding(wavelengths)  # (B, 2L)
+        assert wavelengths.shape[0] == C, (
+            f"wavelengths has {wavelengths.shape[0]} entries but sh tensors have "
+            f"{C} channels. Pass one wavelength per channel."
+        )
 
-        # --- 3. MLP → per-wavelength offset ---
-        delta_sh = self.mlp(gamma)                      # (B, K)
+        # --- 1. Positional embedding: one encoding per channel ---
+        gamma = self.positional_embedding(wavelengths)  # (C, 2L)
 
-        # --- 4. Add offset (broadcast N and B) ---
-        # sh_scalar : (N, K) → (N, 1, K)
-        # delta_sh  : (B, K) → (1, B, K)
-        sh_plus = sh_scalar.unsqueeze(1) + delta_sh.unsqueeze(0)  # (N, B, K)
+        # --- 2. MLP: one (K,) offset vector per channel ---
+        delta_sh = self.mlp(gamma)                      # (C, K)
 
-        return sh_plus  # (N, B, K)
+        # --- 3. Reshape for broadcasting over N Gaussians ---
+        # delta_sh: (C, K) → (1, K, C)
+        delta_sh = delta_sh.permute(1, 0).unsqueeze(0)  # (1, K, C)
+
+        # sh_base: (N, K, C) + (1, K, C) → (N, K, C)
+        sh_plus = sh_base + delta_sh
+
+        return sh_plus  # (N, K, C)
 
 
 # ─── Integration helper ──────────────────────────────────────────────────────

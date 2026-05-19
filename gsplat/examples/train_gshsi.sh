@@ -5,7 +5,7 @@
 #SBATCH --error=./logs/error_rendering_%j.log
 #SBATCH --cpus-per-task=10
 #SBATCH --partition=gpu
-#SBATCH --mem=25G
+#SBATCH --mem=15G
 #SBATCH --time 6:00:00
 
 echo "Running job: $SLURM_JOB_ID"
@@ -54,7 +54,7 @@ print_warning() {
 if [ $# -lt 2 ]; then
     print_error "Not enough arguments"
     echo "Usage: SCENE DENSIFICATION [FLAGS]"
-    echo "  SCENE: Scene name (e.g., soccernet)"
+    echo "  SCENE: Scene name (e.g., ajar or hotdog)"
     echo "  DENSIFICATION: 'classic' or 'mcmc'"
     echo ""
     echo "Flags:"
@@ -95,8 +95,8 @@ if [[ ! "$DENSIFICATION" =~ ^(classic|mcmc)$ ]]; then
     exit 1
 fi
 
-if [[ ! "$RENDER" =~ ^(rgb|hsi)$ ]]; then
-    print_error "The rendering must be 'rgb' or 'hsi', got: $RENDER"
+if [[ ! "$RENDER" =~ ^(spectral_sh|spectral|rgb_sh|rgb)$ ]]; then
+    print_error "The rendering must be 'spectral_sh' or 'spectral' or 'rgb_sh' or 'rgb', got: $RENDER"
     exit 1
 fi
 
@@ -120,6 +120,7 @@ TEST_EVERY=8
 KL_LOSS=false
 SAM_LOSS=false
 WAVE_OPT=false
+SH_HSI=false
 
 NUM_SAVES=2
 
@@ -156,7 +157,7 @@ BILATERAL_SHAPE_W=8
 RGB_DIR="/disk/SYNTHETIC_NESPOF_DATA/${SCENE}_rgb"
 NPY_DIR="/disk/SYNTHETIC_NESPOF_DATA/${SCENE}_npy"
 
-COLMAP_DIR="/disk/SYNTHETIC_NESPOF_DATA/${scene}_colmap/sparse/0"
+COLMAP_DIR="/disk/SYNTHETIC_NESPOF_DATA/${SCENE}_colmap/sparse/0"
 
 
 # DATA_DIR="/disk/SN-NVS-2026-raw/${SCENE}"
@@ -203,22 +204,24 @@ while [[ $# -gt 0 ]]; do
             ;;
             
         --kl-loss)
-            KL_LOSS=$2
-            shift 2
+            KL_LOSS=true
+            shift
             ;;
 
-
         --sam-loss)
-            SAM_LOSS=$2
-            shift 2
+            SAM_LOSS=true
+            shift
             ;;
 
         --wave-opt)
-            WAVE_OPT=$2
-            shift 2
+            WAVE_OPT=true
+            shift
             ;;
 
-
+        --sh-hsi)
+            SH_HSI=true
+            shift
+            ;;
 
         --post-processing)
             case $2 in
@@ -348,9 +351,6 @@ else
     SCENE_OUTPUT="${SCENE}-${RENDER}"
 fi
 
-
-
-
 # If no features, use baseline
 if [ ${#FEATURES[@]} -eq 0 ]; then
     FEATURES=("baseline")
@@ -388,7 +388,8 @@ WANDB_RUN_NAME="${SCENE}_${DENSIFICATION}_${FEATURE_NAME}_run${RUN_NUM}"
 
 WANDB_PATH_CHALLENGE="${OUTPUT_DIR}/sparse/0"
 
-mkdir -p "$RESULT_DIR"
+
+#mkdir -p "$RESULT_DIR"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p ./logs
 
@@ -400,28 +401,28 @@ print_header "COMPUTING SAVE INTERVALS FOR $NUM_SAVES STEPS"
 
 SAVE_STEPS=""
 
-# Generate equally spaced intervals
 for ((i=1; i<=NUM_SAVES; i++)); do
-    # Calculate percentage (1 to NUM_SAVES distributed up to 100)
+
     PERCENT=$(( i * 100 / NUM_SAVES ))
-    
-    # Calculate raw step (-1 adjustment for 0-indexed training loops)
+
     STEP=$(( MAX_STEPS * PERCENT / 100 - 1 ))
-    
-    # Clamp to valid range (never less than 0)
+
     [ $STEP -lt 0 ] && STEP=0
-    
-    # Append to the space-separated string
-    SAVE_STEPS="$SAVE_STEPS $STEP"
-    
-    # Print individual breakdown
+
+    SAVE_STEPS="${SAVE_STEPS}${STEP}"
+
+    # Add comma except last element
+    if [ $i -lt $NUM_SAVES ]; then
+        SAVE_STEPS="${SAVE_STEPS} "
+    fi
+
     echo "   $PERCENT% → Step $STEP"
+
 done
 
-# Trim leading space from the final list
-SAVE_STEPS=$(echo $SAVE_STEPS | xargs)
+SAVE_STEPS="${SAVE_STEPS}"
 
-print_info "Final Save Steps string: \"$SAVE_STEPS\""
+print_info "Final Save Steps string: $SAVE_STEPS"
 
 {
     print_header "EXPERIMENT CONFIGURATION"
@@ -497,23 +498,25 @@ FLAGS="$FLAGS --opacity_reg $OPACITY_REG"
 FLAGS="$FLAGS --scale_reg $SCALE_REG"
 FLAGS="$FLAGS --feature_dim $FEATURE_DIM"
 FLAGS="$FLAGS --max_steps $MAX_STEPS"
-FLAGS="$FLAGS --wandb_run_name $WANDB_RUN_NAME"
-FLAGS="$FLAGS --wandb_steps $WANDB_STEPS_EVAL"
+#FLAGS="$FLAGS --wandb_run_name $WANDB_RUN_NAME"
+#FLAGS="$FLAGS --wandb_steps $WANDB_STEPS_EVAL"
 FLAGS="$FLAGS --ssim_lambda $SSIM_LAMBDA"
-FLAGS="$FLAGS --max_refine_steps $MAX_REFINE_STEPS"
-FLAGS="$FLAGS --wandb_path_challenge $WANDB_PATH_CHALLENGE"
-FLAGS="$FLAGS --max_gaussians $MAX_GAUSSIANS"
+#FLAGS="$FLAGS --max_refine_steps $MAX_REFINE_STEPS"
+#FLAGS="$FLAGS --wandb_path_challenge $WANDB_PATH_CHALLENGE"
+#FLAGS="$FLAGS --max_gaussians $MAX_GAUSSIANS"
 FLAGS="$FLAGS --test_every $TEST_EVERY"
 
-FLAGS="$FLAGS --kl_loss $KL_LOSS"
-FLAGS="$FLAGS --sam_loss $SAM_LOSS"
-FLAGS="$FLAGS --wave_opt $WAVE_OPT"
 
-FLAGS="$FLAGS --save_steps $SAVE_STEPS"
+
+FLAGS="$FLAGS --hyperspectral_data_dir $NPY_DIR"
+FLAGS="$FLAGS --rgb_data_dir $RGB_DIR"
+
+FLAGS="$FLAGS --rendering_mode $RENDER"
+
 
 # Add conditional flags
 if [ "$ABSGRAD" = true ]; then
-    FLAGS="$FLAGS --absgrad"
+ #   FLAGS="$FLAGS --absgrad"
     # --strategy.absgrad and --strategy.grow_grad2d only exist on DefaultStrategy,
     # not MCMCStrategy. Only pass them for the 'classic' (default) densification.
     if [ "$DENSIFICATION" = "classic" ]; then
@@ -546,6 +549,22 @@ if [ -n "$CKPT_PATH" ]; then
     FLAGS="$FLAGS --ckpt $CKPT_PATH"
 fi
 
+
+if [ "$KL_LOSS" = true ]; then
+    FLAGS="$FLAGS --kl_loss"
+fi
+
+if [ "$SAM_LOSS" = true ]; then
+    FLAGS="$FLAGS --sam_loss"
+fi
+
+if [ "$WAVE_OPT" = true ]; then
+    FLAGS="$FLAGS --wave_opt"
+fi
+
+if [ "$RENDER" = "spectral_sh" ]; then
+    FLAGS="$FLAGS --sh_hyperspectral"
+fi
 
 # [ "$GROUND_LOSS"    -eq 1 ] && FLAGS="$FLAGS --ground_depth_loss --ground_seg_dir $GROUND_DIR "
 
@@ -581,14 +600,14 @@ TRAINER_SCRIPT="/home/hensemberk/dev/gsplat_hyperspectral/gsplat/examples/simple
 
 srun python "$TRAINER_SCRIPT" "$DENSIFICATION_CMD" \
     --max_steps $MAX_STEPS \
-    --data_dir $DATA_DIR \
-    --result_dir $RESULT_DIR \
-    --save_steps $MAX_STEPS \
+    --hyperspectral_data_dir $NPY_DIR \
+    --rgb_data_dir $RGB_DIR \
+    --save_steps $SAVE_STEPS \
+    --eval_steps $SAVE_STEPS \
+    --colmap_dir $COLMAP_DIR \
+    --result_dir $OUTPUT_DIR \
     --data_factor $DATA_FACTOR \
     --no-normalize_world_space \
-    --no-load_exposure \
-    --colmap_dir $COLMAP_DIR \
-    --mini_depth_dir $DEPTH_DIR \
     \
     --sh_degree 3 \
     \
@@ -607,70 +626,70 @@ END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
 
-# ============================================================================
-# POST-TRAINING: EVAL + COPY CKPT + CLEANUP TEMP DIR
-# ============================================================================
+# # ============================================================================
+# # POST-TRAINING: EVAL + COPY CKPT + CLEANUP TEMP DIR
+# # ============================================================================
 
-print_header "TRAINING COMPLETED"
-print_info "Duration: $((DURATION / 60)) minutes ($DURATION seconds)"
+# print_header "TRAINING COMPLETED"
+# print_info "Duration: $((DURATION / 60)) minutes ($DURATION seconds)"
 
-REPO_ROOT="/home/hensemberk/dev/gsplat_hyperspectral/gsplat"
-CKPT_SRC_DIR="$RESULT_DIR/ckpts"  
-CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
+# REPO_ROOT="/home/hensemberk/dev/gsplat_hyperspectral/gsplat"
+# CKPT_SRC_DIR="$RESULT_DIR/ckpts"  
+# CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
 
-mkdir -p "$CKPT_DEST_DIR"
+# mkdir -p "$CKPT_DEST_DIR"
 
-print_info "Source checkpoint directory: $CKPT_SRC_DIR"
-print_info "Destination checkpoint directory: $CKPT_DEST_DIR"
+# print_info "Source checkpoint directory: $CKPT_SRC_DIR"
+# print_info "Destination checkpoint directory: $CKPT_DEST_DIR"
 
-if compgen -G "$CKPT_SRC_DIR/ckpt_*.pt" > /dev/null 2>&1; then
-    print_info "Found training checkpoints. Copying all..."
+# if compgen -G "$CKPT_SRC_DIR/ckpt_*.pt" > /dev/null 2>&1; then
+#     print_info "Found training checkpoints. Copying all..."
     
-    CKPT_COUNT=0
-    for ckpt_file in "$CKPT_SRC_DIR"/ckpt_*.pt; do
-        cp "$ckpt_file" "$CKPT_DEST_DIR/" && {
-            CKPT_COUNT=$((CKPT_COUNT + 1))
-            print_info "  [$(basename "$ckpt_file")] ✓"
-        } || {
-            print_error "Failed to copy $(basename "$ckpt_file")"
-        }
-    done
+#     CKPT_COUNT=0
+#     for ckpt_file in "$CKPT_SRC_DIR"/ckpt_*.pt; do
+#         cp "$ckpt_file" "$CKPT_DEST_DIR/" && {
+#             CKPT_COUNT=$((CKPT_COUNT + 1))
+#             print_info "  [$(basename "$ckpt_file")] ✓"
+#         } || {
+#             print_error "Failed to copy $(basename "$ckpt_file")"
+#         }
+#     done
     
-    print_info "Total checkpoints copied: $CKPT_COUNT"
+#     print_info "Total checkpoints copied: $CKPT_COUNT"
     
-    # DYNAMIC FIX: Find the absolute latest checkpoint by step number from the destination folder
-    # Sorts numerically by name so ckpt_1499_rank0.pt comes before ckpt_9999_rank0.pt properly
-    LATEST_CKPT=$(ls -v "$CKPT_DEST_DIR"/ckpt_*.pt 2>/dev/null | tail -1)
+#     # DYNAMIC FIX: Find the absolute latest checkpoint by step number from the destination folder
+#     # Sorts numerically by name so ckpt_1499_rank0.pt comes before ckpt_9999_rank0.pt properly
+#     LATEST_CKPT=$(ls -v "$CKPT_DEST_DIR"/ckpt_*.pt 2>/dev/null | tail -1)
     
-else
-    print_warning "No checkpoints found in $CKPT_SRC_DIR"
-    LATEST_CKPT=""
-fi
+# else
+#     print_warning "No checkpoints found in $CKPT_SRC_DIR"
+#     LATEST_CKPT=""
+# fi
 
-if [ -n "$LATEST_CKPT" ] && [ -f "$LATEST_CKPT" ]; then
-    print_info "Latest checkpoint resolved for evaluation: $(basename "$LATEST_CKPT")"
+# if [ -n "$LATEST_CKPT" ] && [ -f "$LATEST_CKPT" ]; then
+#     print_info "Latest checkpoint resolved for evaluation: $(basename "$LATEST_CKPT")"
 
-    # ── 1. Run evaluation (outputs go to OUTPUT_DIR inside CHALLENGE_DIR) ──
-    print_header "RUNNING EVALUATION"
+#     # ── 1. Run evaluation (outputs go to OUTPUT_DIR inside CHALLENGE_DIR) ──
+#     print_header "RUNNING EVALUATION"
 
-    srun python "$REPO_ROOT/examples/eval_gsplat_hsi.py" \
-        --ckpt "$LATEST_CKPT" \
-        --data_dir "$CHALLENGE_DIR" \
-        --result_folder "$OUTPUT_DIR" \
-        --specific \
-        2>&1 | tee -a "$LOG_FILE"
+#     srun python "$REPO_ROOT/examples/eval_gsplat_hsi.py" \
+#         --ckpt "$LATEST_CKPT" \
+#         --data_dir "$CHALLENGE_DIR" \
+#         --result_folder "$OUTPUT_DIR" \
+#         --specific \
+#         2>&1 | tee -a "$LOG_FILE"
 
-    # ── 2. Summary ──
-    print_info "Evaluation complete. All checkpoints safely preserved in: $CKPT_DEST_DIR"
+#     # ── 2. Summary ──
+#     print_info "Evaluation complete. All checkpoints safely preserved in: $CKPT_DEST_DIR"
 
-    # # ── 3. Delete the temporary training directory ──
-    rm -rf "$RESULT_DIR"
-    print_info "Temp training directory removed: $RESULT_DIR"
+#     # # ── 3. Delete the temporary training directory ──
+#     rm -rf "$RESULT_DIR"
+#     print_info "Temp training directory removed: $RESULT_DIR"
 
-else
-    print_warning "No valid checkpoint found for evaluation."
-    print_warning "Skipping eval and temp-dir cleanup."
-fi
+# else
+#     print_warning "No valid checkpoint found for evaluation."
+#     print_warning "Skipping eval and temp-dir cleanup."
+# fi
 
 
 # ============================================================================
@@ -726,67 +745,67 @@ print_info "Summary saved to: $SUMMARY_FILE"
 
 echo ""
 print_header "✅ EXPERIMENT FINISHED SUCCESSFULLY"
-# ============================================================================
-# Post-processing & Wandb Sync
-# ============================================================================
+# # ============================================================================
+# # Post-processing & Wandb Sync
+# # ============================================================================
 
-# WANDB_DIR_IN_TMP="$RESULT_DIR/wandb"
+# # WANDB_DIR_IN_TMP="$RESULT_DIR/wandb"
+
+# # if [ -f "$CKPT" ] && [ "$TRAIN_EXIT" -eq 0 ]; then
+
+# #     # ── 1. Sync wandb BEFORE deleting /tmp ──
+# #     if [ -d "$WANDB_DIR_IN_TMP" ]; then
+# #         echo "🔄 Syncing wandb offline runs to cloud..."
+# #         export WANDB_MODE=online
+
+# #         SYNC_FAILED=0
+
+# #         # offline runs are named offline-run-YYYYMMDD_HHMMSS-<id>
+# #         while IFS= read -r run_dir; do
+# #             echo "  → Syncing: $(basename $run_dir)"
+# #             wandb sync "$run_dir" \
+# #                 && echo "  ✓ Synced: $(basename $run_dir)" \
+# #                 || { echo "  ⚠ Failed: $(basename $run_dir)"; SYNC_FAILED=1; }
+# #         done < <(find "$WANDB_DIR_IN_TMP" -maxdepth 1 -type d -name "offline-run-*")
+
+# #         # Check if any runs were actually found
+# #         RUN_COUNT=$(find "$WANDB_DIR_IN_TMP" -maxdepth 1 -type d -name "offline-run-*" | wc -l)
+# #         if [ "$RUN_COUNT" -eq 0 ]; then
+# #             echo "⚠ No offline-run-* directories found in $WANDB_DIR_IN_TMP"
+# #             echo "⚠ Contents of wandb dir:"
+# #             ls -la "$WANDB_DIR_IN_TMP"
+# #         elif [ $SYNC_FAILED -eq 0 ]; then
+# #             echo "✓ All $RUN_COUNT wandb run(s) synced successfully"
+# #         else
+# #             echo "⚠ Some wandb runs failed to sync (non-fatal)"
+# #         fi
+# #     else
+# #         echo "⚠ No wandb directory found at $WANDB_DIR_IN_TMP — skipping sync"
+# #     fi
+
+# #     # ── 2. Clean up temp directory AFTER sync ──
+# #     echo "🧹 Removing temp training directory: $RESULT_DIR"
+# #     rm -rf "$RESULT_DIR" \
+# #         && echo "✓ Temp directory removed" \
+# #         || echo "⚠ Failed to remove temp dir: $RESULT_DIR"
+
+# # else
+# #     echo "⚠ Training failed (exit=$TRAIN_EXIT) or checkpoint not found at: $CKPT"
+# #     echo "⚠ Keeping temp dir for inspection: $RESULT_DIR"
+# # fi
+
 
 # if [ -f "$CKPT" ] && [ "$TRAIN_EXIT" -eq 0 ]; then
+#     CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
+#     mkdir -p "$CKPT_DEST_DIR"
+#     cp "$CKPT" "$CKPT_DEST_DIR/"
+#     print_info "Checkpoint copied to: $CKPT_DEST_DIR/$(basename $CKPT)"
 
-#     # ── 1. Sync wandb BEFORE deleting /tmp ──
-#     if [ -d "$WANDB_DIR_IN_TMP" ]; then
-#         echo "🔄 Syncing wandb offline runs to cloud..."
-#         export WANDB_MODE=online
-
-#         SYNC_FAILED=0
-
-#         # offline runs are named offline-run-YYYYMMDD_HHMMSS-<id>
-#         while IFS= read -r run_dir; do
-#             echo "  → Syncing: $(basename $run_dir)"
-#             wandb sync "$run_dir" \
-#                 && echo "  ✓ Synced: $(basename $run_dir)" \
-#                 || { echo "  ⚠ Failed: $(basename $run_dir)"; SYNC_FAILED=1; }
-#         done < <(find "$WANDB_DIR_IN_TMP" -maxdepth 1 -type d -name "offline-run-*")
-
-#         # Check if any runs were actually found
-#         RUN_COUNT=$(find "$WANDB_DIR_IN_TMP" -maxdepth 1 -type d -name "offline-run-*" | wc -l)
-#         if [ "$RUN_COUNT" -eq 0 ]; then
-#             echo "⚠ No offline-run-* directories found in $WANDB_DIR_IN_TMP"
-#             echo "⚠ Contents of wandb dir:"
-#             ls -la "$WANDB_DIR_IN_TMP"
-#         elif [ $SYNC_FAILED -eq 0 ]; then
-#             echo "✓ All $RUN_COUNT wandb run(s) synced successfully"
-#         else
-#             echo "⚠ Some wandb runs failed to sync (non-fatal)"
-#         fi
-#     else
-#         echo "⚠ No wandb directory found at $WANDB_DIR_IN_TMP — skipping sync"
-#     fi
-
-#     # ── 2. Clean up temp directory AFTER sync ──
 #     echo "🧹 Removing temp training directory: $RESULT_DIR"
 #     rm -rf "$RESULT_DIR" \
 #         && echo "✓ Temp directory removed" \
 #         || echo "⚠ Failed to remove temp dir: $RESULT_DIR"
-
 # else
-#     echo "⚠ Training failed (exit=$TRAIN_EXIT) or checkpoint not found at: $CKPT"
-#     echo "⚠ Keeping temp dir for inspection: $RESULT_DIR"
+#     echo "⚠ Training failed or checkpoint not found"
+#     echo "⚠ Keeping temp dir: $RESULT_DIR"
 # fi
-
-
-if [ -f "$CKPT" ] && [ "$TRAIN_EXIT" -eq 0 ]; then
-    CKPT_DEST_DIR="$OUTPUT_DIR/ckpts"
-    mkdir -p "$CKPT_DEST_DIR"
-    cp "$CKPT" "$CKPT_DEST_DIR/"
-    print_info "Checkpoint copied to: $CKPT_DEST_DIR/$(basename $CKPT)"
-
-    echo "🧹 Removing temp training directory: $RESULT_DIR"
-    rm -rf "$RESULT_DIR" \
-        && echo "✓ Temp directory removed" \
-        || echo "⚠ Failed to remove temp dir: $RESULT_DIR"
-else
-    echo "⚠ Training failed or checkpoint not found"
-    echo "⚠ Keeping temp dir: $RESULT_DIR"
-fi

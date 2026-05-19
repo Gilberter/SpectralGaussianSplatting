@@ -6,7 +6,7 @@ from typing import Literal, Optional
 import numpy as np
 import torch
 
-from utils import spectrum_to_rgb
+from utils_color import spectrum_to_rgb
 
 
 def sh2rgb(sh: torch.Tensor) -> torch.Tensor:
