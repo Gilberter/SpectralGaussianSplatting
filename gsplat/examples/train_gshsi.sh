@@ -140,6 +140,12 @@ SCALE_REG=0.01
 APP_EMBED_DIM=16
 FEATURE_DIM=32
 GROW_GRAD2D=0.0008
+# PARAMETERS FOR ABUDANCES AND ENDMEMBERS
+AE_OPT=false
+NUM_ENDMEMBERS=5
+AE_HEIGHT=512
+AE_WIDTH=512
+
 
 # Bilateral grid parameters
 BILATERAL_SHAPE_X=16
@@ -279,10 +285,22 @@ while [[ $# -gt 0 ]]; do
             APP_EMBED_DIM=$2
             shift 2
             ;;
+
+        --ae-opt)
+            AE_OPT=true
+            shift
+            ;;
+
+        --num-endmembers)
+            NUM_ENDMEMBERS=$2
+            shift 2
+            ;;
+
         --ssim-lambda)
             SSIM_LAMBDA=$2
             shift 2
             ;;
+
         --strategy-depth)
             STRATEGY_DEPTH=$2
             shift 2
@@ -343,6 +361,11 @@ fi
 if [ "$BILATERAL" = true ]; then
     FEATURES+=("bilateral")
 fi
+
+if [ "$AE_OPT" = true ]; then
+    FEATURES+=("aeopt")
+fi
+
 
 
 if [ "$DEPTH_LOSS" = true ]; then
@@ -566,6 +589,9 @@ if [ "$RENDER" = "spectral_sh" ]; then
     FLAGS="$FLAGS --sh_hyperspectral"
 fi
 
+if [ "$AE_OPT" = true ]; then
+    FLAGS="$FLAGS --ae_opt"
+fi
 # [ "$GROUND_LOSS"    -eq 1 ] && FLAGS="$FLAGS --ground_depth_loss --ground_seg_dir $GROUND_DIR "
 
 # -------------------------

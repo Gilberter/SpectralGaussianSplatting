@@ -31,7 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, RootMeanSquaredErrorUsingSlidingWindow, SpectralAngleMapper
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, sam_metric, compute_per_band_metrics, spectral_angle_mapper, _apply_colormap, WavelengthEncoder, get_wavelength_modulated_colors, spectral_kl_loss
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, spectral_angle_mapper, _apply_colormap, WavelengthEncoder, spectral_kl_loss, NaiveHSIUnmixer
 from utils_color import spectrum_to_rgb
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -252,6 +252,15 @@ class Config:
     ground_depth_lambda: float = 2.3
     ground_seg_dir: str = ""
     ground_depth_start_step: int = 1000
+    
+    # Endmemerbs and abundances
+
+    ae_opt:bool = False
+    num_endmembers:int = 5
+    ae_lr:float = 0.01
+    ae_height:int = 512
+    ae_weight:int = 512
+    init_mode: str = "random" # random or kmeans
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -300,7 +309,13 @@ def create_splats_with_optimizers(
     # Hyperspectral conf
     num_spectral_bands: int = 21,
     use_hyperspectral:bool = True,
-    sh_hyperspectral:bool = False    
+    sh_hyperspectral:bool = False,
+    ae_opt: bool = False,
+    num_endmembers: int = 5,
+    ae_lr: float = 1e-2,
+    ae_height: int = 512,
+    ae_width: int = 512,
+    init_mode: str = "random",
 
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
 
@@ -344,6 +359,7 @@ def create_splats_with_optimizers(
     ]
 
     #use_hyperspectral is obvious
+
     
     if use_hyperspectral:
         if sh_hyperspectral:
@@ -352,10 +368,19 @@ def create_splats_with_optimizers(
             bands[:, 0, :] = rgb_to_sh(torch.full((N, num_spectral_bands), 0.5))
             params.append(("sh0", torch.nn.Parameter(bands[:, :1, :]), sh0_lr))
             params.append(("shN", torch.nn.Parameter(bands[:, 1:, :]), shN_lr))
+        
+        elif ae_opt:
+            abundances_init = torch.zeros(N, num_endmembers)
+            params.append(("abundances", torch.nn.Parameter(abundances_init), ae_lr))
+
+            endmembers = torch.nn.Parameter(
+                torch.rand(num_endmembers, num_spectral_bands)
+            )
         else:
             #print("HYPERSPECTRAL (no SH)")
             spectrum = torch.rand((N, num_spectral_bands))
             params.append(("spectrum", torch.nn.Parameter(spectrum), sh0_lr))
+        
 
     else:  # RGB
         if sh_degree is not None and sh_degree >= 0:
@@ -368,16 +393,16 @@ def create_splats_with_optimizers(
             print("RGB (no SH)")
             colors = torch.full((N, 3), 0.5)
             params.append(("sh0", torch.nn.Parameter(rgb_to_sh(colors)), sh0_lr))
-    
+
+
     # parameter dictionary
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-
+    
     # Scale learning rate based on batch size, reference:
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
-
-
+    
     BS = batch_size * world_size # batch size scaling
     # batch_size per gpu
     # world_size number of gpus
@@ -388,6 +413,7 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+        
     optimizers = {
         name: optimizer_class(
             [
@@ -403,10 +429,26 @@ def create_splats_with_optimizers(
             fused=True, # CUDA fused Adam Kernel
         )
         for name, _, lr in params
-    }
+    }   
+
+    endmembers_optimizer  = None
+    if ae_opt and endmembers is not None:
+        # Endmembers get their own optimizer, separate from splats
+        # Lower LR than abundances: E affects ALL pixels simultaneously,
+        # so large steps destabilize training
+        endmembers_optimizer = optimizer_class(
+            [{"params": endmembers, "lr": ae_lr * 0.5, "name": "endmembers"}],
+            eps=1e-15 / math.sqrt(BS),
+            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            fused=True,
+        )
+        # NOTE: abundances optimizer is already created in the splats loop above
+        # because "abundances" is a key in params and therefore in splats
+ 
     print(f"Splats {splats}")
     # splat and optimizers
-    return splats, optimizers
+    return splats, optimizers, endmembers, endmembers_optimizer
+
     # splats holds all learnable tensors
     # splats = ParameterDict({
     # "means":      Parameter([N, 3]),
@@ -495,8 +537,7 @@ class Runner:
         print("Scene scale:", self.scene_scale)
 
         # Model
-        feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers = create_splats_with_optimizers(
+        self.splats, self.optimizers, self.endmembers, self.endmembers_optimizer = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
@@ -514,14 +555,22 @@ class Runner:
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
+            feature_dim=cfg.feature_dim,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
             sh_hyperspectral=cfg.sh_hyperspectral, # False 
-            use_hyperspectral=cfg.use_hyperspectral # True
+            use_hyperspectral=cfg.use_hyperspectral, # True
+            ae_opt=cfg.ae_opt,
+            num_endmembers=cfg.num_endmembers,
+            ae_lr=cfg.ae_lr,
+
         )
-        #print("Model initialized. Number of GS:", len(self.splats["means"]))
+        print("Model initialized. Number of GS:", len(self.splats["means"]))
+        if cfg.ae_opt:
+            assert not cfg.sh_hyperspectral, "Cannot run abundances/endmembers optimization with SH hyperspectral enabled!"
+            print(f"Model using Abudances and Endmembers Optimization")
+
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -684,8 +733,7 @@ class Runner:
         
 
         means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
+ 
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3] scales are stored in log-space and rendered in exp space
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,] opacity is stored in logit space and redered in sigmoid space
@@ -698,6 +746,12 @@ class Runner:
                 colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)
                 sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
 
+            elif self.cfg.ae_opt:
+                # sigmoid → values in (0,1), shape [N, M]
+                # Rasterizer will alpha-composite these into [C, H, W, M]   
+                colors = torch.sigmoid(self.splats["abundances"])  # [N, M]
+                sh_degree_for_render = kwargs.pop("sh_degree", None)
+                sh_degree_for_render = None  # no SH on abundance channels
             else:
                 colors = torch.sigmoid(self.splats["spectrum"])  # [.., N, num_bands]
                 sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
@@ -713,11 +767,6 @@ class Runner:
                 sh_degree_for_render = None  # Disable SH processing
 
 
-                
-        
-
-        #print("sh_degree_for_render",sh_degree_for_render)
-        #print("colors shape", colors.shape)
         #  Appearance Optimization Module
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -891,7 +940,6 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
-            # pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             pixels = data["image"].to(device) # [1, H, W, BANDS]
 
             num_train_rays_per_step = ( # only for performance reporting
@@ -915,18 +963,16 @@ class Runner:
             # sh schedule
             # start with low frequency color
             # gradually add high frequency SH
-            if cfg.sh_hyperspectral or cfg.sh_degree is not None:
-                
-
+            if (cfg.sh_hyperspectral or cfg.sh_degree is not None) and not cfg.ae_opt:
                 sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
-
+                if step % cfg.sh_degree_interval == 0:
+                    print(f"Now Using SH Degree {sh_degree_to_use}/{cfg.sh_degree}")
             else:
                 sh_degree_to_use = None
 
-            if step % cfg.sh_degree_interval and sh_degree_to_use <= cfg.sh_degree:
-                print(f"Now Using SH Degree {sh_degree_to_use}/{cfg.sh_degree}")
             # forward
             # the rendering
+
             self.sh_degree_to_use = sh_degree_to_use
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -941,20 +987,35 @@ class Runner:
                 render_mode="RGB",
                 masks=masks,
             )
-            # ##print("renders", renders.shape)
-            # #print("alphas", alphas.shape)
-            # #print("info batch",info['batch_ids'])
-            # #print("info ids", info['camera_ids'])
-            # #print("gaussian ids", info['gaussian_ids'])
-            # #print("info dic", info.keys())
-            # #print("radii", info['radii'].shape)
-            # RGB AND DEPTH
-            # if renders.shape[-1] == 4:
-            #     colors, depths = renders[..., 0:3], renders[..., 3:4]
-            # else:
-            #     colors, depths = renders, None
-            colors, depths = renders, None
+
+            if cfg.ae_opt and self.endmembers is not None:
+                # rendered: [C, H, W, M]
+                # E:        [M, B]  (apply softplus for non-negativity)
+                E = torch.nn.functional.softplus(self.endmembers).to(renders.device)  # [M, B]
+                E = E.clamp(max=10.0)
+                # einsum is clearest; equivalent to rendered.reshape(-1,M) @ E reshaped back
+
+                abundances = renders / (renders.sum(dim=-1, keepdim=True) + 1e-8)
+                # abundances = torch.nn.softmax(renders, dim=-1)
+
+                colors = torch.einsum("chwm,mb->chwb", renders, E).clamp(0.0, 1.0) # [C, H, W, B]
+                # Optional: clamp to [0,1] — sigmoid on abundances + softplus on E
+                # can produce values > 1 if E values are large
+                colors = torch.nan_to_num(colors, nan=0.0, posinf=1.0, neginf=0.0)
+
+            else:
+                colors = renders  # [C, H, W, B] original path
             
+            if not torch.isfinite(colors).all():
+                print(f"[WARN] step {step}: non-finite colors, skipping")
+                for opt in self.optimizers.values():
+                    opt.zero_grad(set_to_none=True)
+                if self.endmembers_optimizer is not None:
+                    self.endmembers_optimizer.zero_grad(set_to_none=True)
+                continue
+            
+            depths = None
+                        
             # PHOTOMETRIC POST PROCESSING
 
             if cfg.use_bilateral_grid:
@@ -1066,6 +1127,15 @@ class Runner:
 
             loss.backward() # backward pass
 
+
+            torch.nn.utils.clip_grad_norm_(
+                list(self.splats.parameters()), max_norm=1.0
+            )
+            if self.endmembers is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    [self.endmembers], max_norm=1.0
+                )
+
             desc = f"loss={loss.item():.3f}| ssim= {ssimloss} l1loss = {l1loss} "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
@@ -1079,15 +1149,7 @@ class Runner:
                 desc += f"sam loss={samloss}"
             pbar.set_description(desc)
 
-            # write images (gt and render)
-            # if world_rank == 0 and step % 800 == 0:
-            #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-            #     canvas = canvas.reshape(-1, *canvas.shape[2:])
-            #     imageio.imwrite(
-            #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * 255).astype(np.uint8),
-            #     )
-            #print(f"world_rank {world_rank} and tb_every {cfg.tb_every}")
+   
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 assert world_rank == 0, print(f"tb_every {cfg.tb_every}, step {step} , step%tb_every {step % cfg.tb_every}")
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1135,6 +1197,9 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
+                if cfg.ae_opt and self.endmembers is not None:
+                    data["endmembers"] = self.endmembers.data   # save raw parameter
+ 
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -1254,6 +1319,13 @@ class Runner:
             for scheduler in schedulers:
                 scheduler.step()
 
+            
+            if self.endmembers_optimizer is not None:
+                self.endmembers_optimizer.step()
+                self.endmembers_optimizer.zero_grad(set_to_none=True)
+                with torch.no_grad():
+                    self.endmembers.clamp_(-10.0, 10.0)
+
             # Run post-backward steps after backward and optimizer
             # Adaptive part of Gaussian Splatting
             if isinstance(self.cfg.strategy, DefaultStrategy):
@@ -1324,7 +1396,7 @@ class Runner:
         os.makedirs(f"{cfg.result_dir}/rgb", exist_ok=True)
         os.makedirs(f"{cfg.result_dir}/hsi", exist_ok=True)
         for i, data in enumerate(valloader):
-            #print("data shape",data.keys())
+
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             spectrum_gt = data["image"].to(device) 
@@ -1358,6 +1430,64 @@ class Runner:
                 far_plane=cfg.far_plane,
                 masks=masks,
             )  # [1, H, W, Bands] 
+
+            if cfg.ae_opt and self.endmembers is not None:
+
+                E_raw = self.endmembers
+                E     = torch.nn.functional.softplus(E_raw).to(spectrum_pre.device)
+                E = E.clamp(max=10.0)
+            
+                # ── Diagnostic: rendered_pre ──────────────────────────────────────────
+                r_nan  = torch.isnan(spectrum_pre).sum().item()
+                r_inf  = torch.isinf(spectrum_pre).sum().item()
+                r_min  = spectrum_pre.min().item()
+                r_max  = spectrum_pre.max().item()
+                print(f"[DIAG] spectrum_pre  | nan={r_nan}  inf={r_inf}  min={r_min:.4f}  max={r_max:.4f}  shape={tuple(spectrum_pre.shape)}")
+            
+                # ── Diagnostic: E ─────────────────────────────────────────────────────
+                e_nan  = torch.isnan(E).sum().item()
+                e_inf  = torch.isinf(E).sum().item()
+                e_min  = E.min().item()
+                e_max  = E.max().item()
+                e_raw_min = E_raw.min().item()
+                e_raw_max = E_raw.max().item()
+                print(f"[DIAG] E (softplus)  | nan={e_nan}  inf={e_inf}  min={e_min:.4f}  max={e_max:.4f}")
+                print(f"[DIAG] E_raw         | min={e_raw_min:.4f}  max={e_raw_max:.4f}")
+            
+                # # ── Diagnostic: alphas ────────────────────────────────────────────────
+                # a_nan = torch.isnan(render_alphas_pre).sum().item()  # use whatever your alpha var is named
+                # a_min = render_alphas_pre.min().item()
+                # a_max = render_alphas_pre.max().item()
+                # print(f"[DIAG] render_alphas | nan={a_nan}  min={a_min:.4f}  max={a_max:.4f}")
+            
+                # ── Safe einsum ───────────────────────────────────────────────────────
+                rendered_clean = torch.nan_to_num(spectrum_pre, nan=0.0, posinf=1.0, neginf=0.0)
+                spectrum_pre   = torch.einsum("chwm,mb->chwb", rendered_clean, E).clamp(0.0, 1.0)
+                spectrum_pre   = torch.nan_to_num(spectrum_pre, nan=0.0, posinf=1.0, neginf=0.0)
+            
+                # ── Diagnostic: output ────────────────────────────────────────────────
+                o_nan = torch.isnan(spectrum_pre).sum().item()
+                o_inf = torch.isinf(spectrum_pre).sum().item()
+                print(f"[DIAG] spectrum_pre  | nan={o_nan}  inf={o_inf}  min={spectrum_pre.min():.4f}  max={spectrum_pre.max():.4f}")
+            
+                # ── Per-channel NaN check on E ────────────────────────────────────────
+                if e_nan > 0 or e_inf > 0:
+                    for m in range(E.shape[0]):
+                        print(f"[DIAG]   E[{m}] nan={torch.isnan(E[m]).sum().item()}  "
+                            f"inf={torch.isinf(E[m]).sum().item()}  "
+                            f"min={E[m].min().item():.4f}  max={E[m].max().item():.4f}")
+            
+                # ── Per-channel NaN check on rendered_pre ─────────────────────────────
+                if r_nan > 0 or r_inf > 0:
+                    C, H, W, M = spectrum_pre.shape
+                    for m in range(M):
+                        ch = spectrum_pre[..., m]
+                        print(f"[DIAG]   rendered[...,{m}] nan={torch.isnan(ch).sum().item()}  "
+                            f"inf={torch.isinf(ch).sum().item()}  "
+                            f"min={ch.min().item():.4f}  max={ch.max().item():.4f}")
+            
+            else:
+                spectrum_pre = spectrum_pre
     
             ellipse_time += max(time.time() - tic, 1e-10)
 
@@ -1380,13 +1510,11 @@ class Runner:
                 )
                 
                 print(f"ANTES spectrum_pre range: [{spectrum_pre.min():.4f}, {spectrum_pre.max():.4f}]")
-                print(f"ANTES rgb_pre range: [{rgb_pre.min():.4f}, {rgb_pre.max():.4f}]")
 
 
                 if spectrum_gt.max() > 1:
                     spectrum_gt = spectrum_gt / spectrum_gt.max().clamp(min=1e-8)
                     spectrum_gt = torch.clamp(spectrum_gt,0.0,1.0)
-                    #print(f"Pixels only positive values min {pixels.min()} max {pixels.max()}  Colors min {colors.min()} Colors max {colors.max()}")
 
                 if spectrum_pre.max() > 1:
                     spectrum_pre = spectrum_pre / spectrum_pre.max().clamp(min=1e-8)
@@ -1397,7 +1525,6 @@ class Runner:
                 spectrum_gt = torch.clamp(spectrum_gt,0,1).contiguous().permute(0,3,1,2)
 
                 print(f"DESPUES spectrum_pre range: [{spectrum_pre.min():.4f}, {spectrum_pre.max():.4f}]")
-                print(f"DESPUES rgb_pre range: [{rgb_pre.min():.4f}, {rgb_pre.max():.4f}]")
                 
                 rgb_pre = spectrum_to_rgb(spectrum_pre, start=450, end=650, bands=cfg.num_spectral_bands).permute(0,3,1,2)
                 rgb_gt = spectrum_to_rgb(spectrum_gt, start=450, end=650, bands=cfg.num_spectral_bands).permute(0,3,1,2)

@@ -42,78 +42,6 @@ def spectral_angle_mapper(x, y, eps=1e-8):
     sam_map = torch.acos(cos) #radians
     return sam_map.mean()
 
-import torch
-import numpy as np
-
-def compute_per_band_metrics(pred_image, gt_image, mask=None):
-    """
-    Compute PSNR and RMSE per band for hyperspectral images
-    
-    Args:
-        gt_image: Ground truth image [1, B, H, W] 
-        pred_image: Predicted image [1, B, H, W]
-        mask: Optional [1, H, W] or [H, W] with valid pixels (True = valid)
-    
-    Returns:
-        psnr_per_band: Tensor of PSNR values per band [B]
-        rmse_per_band: Tensor of RMSE values per band [B]
-        mse_per_band: Tensor of MSE values per band [B]
-    """
-    
-    # Ensure images are the same shape
-    assert gt_image.shape == pred_image.shape, f"Shape mismatch: {gt_image.shape} vs {pred_image.shape}"
-    
-    # Extract dimensions: [1, B, H, W]
-    batch, B, H, W = gt_image.shape
-    assert batch == 1, f"Expected batch size 1, got {batch}"
-    
-    # Handle mask
-    if mask is not None:
-        # Mask could be [1, H, W]
-        
-        # Reshape mask for broadcasting: [H, W] -> [1, 1, H, W]
-        mask = mask.reshape(1, 1, H, W)
-        
-        # Apply mask
-        gt_masked = gt_image * mask
-        pred_masked = pred_image * mask
-        n_valid_pixels = mask.sum().float()  # Total valid pixels
-    else:
-        gt_masked = gt_image
-        pred_masked = pred_image
-        n_valid_pixels = H * W
-    
-    # Compute per-band MSE - sum over H and W dimensions
-    # Shape: [1, B, H, W] -> sum over dims 2,3 (H,W) -> [1, B]
-    mse_per_band = ((gt_masked - pred_masked) ** 2).sum(dim=(2, 3)) / n_valid_pixels
-    mse_per_band = mse_per_band.squeeze(0)  # Remove batch dimension -> [B]
-    
-    # Compute per-band RMSE
-    rmse_per_band = torch.sqrt(mse_per_band + 1e-8)  # Add epsilon for numerical stability
-    
-    # Compute per-band PSNR
-    # Find max value per band - max over H and W dimensions
-    max_val_per_band = gt_masked.max(dim=2)[0].max(dim=2)[0]  # [1, B]
-    max_val_per_band = max_val_per_band.squeeze(0)  # [B]
-    
-    # Handle case where max is 0 (avoid division by zero)
-    max_val_per_band = torch.clamp(max_val_per_band, min=1e-8)
-    
-    # PSNR = 20 * log10(max_val / sqrt(MSE))
-    psnr_per_band = 20 * torch.log10(max_val_per_band / torch.sqrt(mse_per_band + 1e-8))
-    
-    return psnr_per_band, rmse_per_band, mse_per_band
-
-def sam_metric(x, y, reduce=True):
-    """
-    Returns mean SAM in degrees (standard reporting convention).
-    Args:
-        x, y: [B, H, W, C] or [N, C]
-    """
-    angle = spectral_angle_mapper(x, y)  # [B, H, W] or [N]
-    angle_deg = torch.rad2deg(angle)
-    return angle_deg.mean() if reduce else angle_deg
-
 def spectral_kl_loss(
     X_gt: torch.Tensor,     # (H, W, B)
     X_pred: torch.Tensor,   # (H, W, B)
@@ -422,35 +350,46 @@ class AppearanceOptModule(torch.nn.Module):
 ### Wavelength Dependet Apperance Module
 
 
-
-
 class WavelengthEncoder(nn.Module):
     """
     Learns wavelength-specific offsets (δSH_λ) to add to base SH coefficients.
 
     For each wavelength λ (normalized to [0,1]):
       1. Positional embedding: γ(λ) = [sin(2^k π λ), cos(2^k π λ)] for k=0..L-1
-      2. MLP maps γ(λ) → δSH_λ  of shape (sh_coeffs,)
-      3. SH+_λ = SH_λ + δSH_λ   (broadcast over all N Gaussians)
+      2. MLP maps γ(λ) → δSH_λ of shape (K,)  — one offset per SH coeff
+      3. SH+_λ = SH_λ + δSH_λ   broadcast over N Gaussians
+
+    Works for both:
+      - RGB SH:  sh0 [N, 1, 3],   shN [N, K-1, 3]   → output [N, K, 3]
+      - HSI SH:  sh0 [N, 1, B],   shN [N, K-1, B]   → output [N, K, B]
+
+    The MLP learns a scalar offset per SH coefficient per wavelength.
+    That scalar is then broadcast across all N Gaussians.
 
     Args:
-        sh_degree   : degree of spherical harmonics (3 → 16 coeffs, 4 → 25, etc.)
-        n_freq_bands: L in the paper, number of sinusoidal frequency bands
-        hidden_dim  : width of the MLP hidden layers
+        sh_degree    : degree of spherical harmonics (3 → 16 coeffs, 4 → 25, etc.)
+        n_freq_bands : L in the positional encoding, number of sinusoidal frequency bands
+        hidden_dim   : width of the MLP hidden layers
     """
 
-    def __init__(self, sh_degree: int = 3, n_freq_bands: int = 8, hidden_dim: int = 64):
+    def __init__(
+        self,
+        sh_degree: int = 3,
+        n_freq_bands: int = 8,
+        hidden_dim: int = 64,
+    ):
         super().__init__()
         self.sh_degree = sh_degree
         self.n_freq_bands = n_freq_bands
 
-        # (degree+1)^2 SH coefficients per wavelength
-        self.n_sh_coeffs = (sh_degree + 1) ** 2  # 16 for degree 3
+        # (degree+1)^2 SH coefficients
+        self.n_sh_coeffs = (sh_degree + 1) ** 2   # e.g. 16 for degree 3
 
-        # Positional embedding output dim: sin + cos per band
-        pe_dim = 2 * n_freq_bands  # 16 for L=8
+        pe_dim = 2 * n_freq_bands                  # sin + cos per band
 
-        # MLP: γ(λ) → δSH_λ of shape (n_sh_coeffs,)
+        # MLP: γ(λ) → δSH  of shape (n_sh_coeffs,)
+        # One scalar offset per SH coefficient, shared across all Gaussians
+        # and broadcast across the channel (RGB or spectral band) dimension.
         self.mlp = nn.Sequential(
             nn.Linear(pe_dim, hidden_dim),
             nn.ReLU(),
@@ -459,24 +398,28 @@ class WavelengthEncoder(nn.Module):
             nn.Linear(hidden_dim, self.n_sh_coeffs),
         )
 
-        # Initialize last layer to near-zero so offsets start small
+        # Start near zero so the model trains from the base SH coefficients
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
-        # Register frequency bands as a buffer (not a learned param)
+        # Frequency bands — not learned
         freqs = 2.0 ** torch.arange(n_freq_bands)  # [L]
         self.register_buffer("freqs", freqs)
 
     def positional_embedding(self, wavelengths: torch.Tensor) -> torch.Tensor:
         """
+        Sinusoidal positional encoding for scalar wavelength values.
+
         Args:
-            wavelengths: (B,) normalized wavelengths in [0, 1]
+            wavelengths: (C,) normalized wavelengths in [0, 1]
+                         C = 3 for RGB, C = num_spectral_bands for HSI
+
         Returns:
-            γ(λ): (B, 2*L) sinusoidal embeddings
+            γ(λ): (C, 2*L)
         """
-        # (B, 1) * (L,) → (B, L)
+        # (C, 1) * (L,) → (C, L)
         angles = 2.0 * math.pi * wavelengths.unsqueeze(-1) * self.freqs
-        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)  # (B, 2L)
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)  # (C, 2L)
 
     def forward(
         self,
@@ -528,25 +471,93 @@ class WavelengthEncoder(nn.Module):
         sh_plus = sh_base + delta_sh
 
         return sh_plus  # (N, K, C)
+        
 
-
-# ─── Integration helper ──────────────────────────────────────────────────────
-
-def get_wavelength_modulated_colors(
-    splats: dict,
-    wavelength_encoder: WavelengthEncoder,
-    wavelengths: torch.Tensor,   # (B,) normalized wavelengths
-) -> torch.Tensor:
+ 
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+ 
+class NaiveHSIUnmixer(nn.Module):
     """
-    Drop-in replacement for the standard:
-        colors = torch.cat([splats["sh0"], splats["shN"]], dim=1)  # (N, K, 3)
-
-    Returns (N, B, K) — one SH set per Gaussian per wavelength band.
+    Learnable per-pixel abundances + global endmembers.
+ 
+    Parameters
+    ----------
+    height, width : int
+        Spatial dimensions of the HSI image.
+    num_bands : int
+        Number of spectral bands.
+    num_endmembers : int
+        Number of pure material spectra to learn (hyperparameter).
+    init_mode : str
+        How to initialize endmembers: 'random' or 'kmeans'.
+        'kmeans' picks random pixels as initial endmembers (VCA-lite).
     """
-    sh0 = splats["sh0"]   # (N, 1, 3)
-    shN = splats["shN"]   # (N, K-1, 3)
-    return wavelength_encoder(sh0, shN, wavelengths)  # (N, B, K)
-
+ 
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        num_bands: int,
+        num_endmembers: int = 5,
+        init_mode: str = "random",
+        gt_pixels: torch.Tensor = None,  # [H*W, B] for kmeans init
+    ):
+        super().__init__()
+        self.H = height
+        self.W = width
+        self.B = num_bands
+        self.M = num_endmembers
+ 
+        # ---- Abundances: [H, W, M] (raw logits, softmax applied in forward) ----
+        # Initialized near uniform — no prior on which material dominates
+        self.abundances = nn.Parameter(
+            torch.zeros(height, width, num_endmembers)
+        )
+ 
+        # ---- Endmembers: [M, B] (raw values, ReLU applied to enforce non-negativity) ----
+        if init_mode == "kmeans" and gt_pixels is not None:
+            # Pick M random pixels as starting endmembers (Vertex Component Analysis lite)
+            idx = torch.randperm(gt_pixels.shape[0])[:num_endmembers]
+            init_em = gt_pixels[idx].float()  # [M, B]
+            self.endmembers = nn.Parameter(init_em)
+        else:
+            # Random init scaled to plausible reflectance range [0, 1]
+            self.endmembers = nn.Parameter(
+                torch.rand(num_endmembers, num_bands)
+            )
+ 
+    def forward(self) -> torch.Tensor:
+        """
+        Returns reconstructed HSI: [H, W, B]
+ 
+        Steps:
+          1. softmax over endmember dim → abundances sum to 1 per pixel (simplex constraint)
+          2. relu on endmembers       → non-negative spectra
+          3. einsum(abundances, endmembers) → [H, W, B]
+        """
+        # [H, W, M] — each pixel's mixture weights sum to 1
+        abund = F.softmax(self.abundances, dim=-1)
+ 
+        # [M, B] — non-negative pure spectra
+        em = F.relu(self.endmembers)
+ 
+        # [H, W, B] = [H, W, M] @ [M, B]
+        hsi_pred = torch.einsum("hwm,mb->hwb", abund, em)
+ 
+        return hsi_pred
+ 
+    @torch.no_grad()
+    def get_abundances(self) -> torch.Tensor:
+        """Returns the softmax-normalized abundance maps [H, W, M]."""
+        return F.softmax(self.abundances, dim=-1)
+ 
+    @torch.no_grad()
+    def get_endmembers(self) -> torch.Tensor:
+        """Returns the relu-clipped endmember spectra [M, B]."""
+        return F.relu(self.endmembers)
+ 
 
 
 def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
