@@ -23,24 +23,65 @@ def _apply_colormap(x: np.ndarray, cmap: str = "magma") -> np.ndarray:
     return rgb
 
     
-def spectral_angle_mapper(x, y, eps=1e-8):
+def spectral_angle_mapper(x, y, eps=1e-6):
     """
-    Spectral Angle Mapper (SAM) metric.
+    SAM loss, NaN-safe.
+    x, y: [..., C] any leading dims (B, H, W, C)
+    Returns: scalar mean angle in radians
+    """
+    # Guard against zero vectors BEFORE normalizing
+    x_norm_val = x.norm(p=2, dim=-1, keepdim=True).clamp(min=eps)
+    y_norm_val = y.norm(p=2, dim=-1, keepdim=True).clamp(min=eps)
+
+    x_unit = x / x_norm_val   # [..., C]
+    y_unit = y / y_norm_val   # [..., C]
+
+    # Dot product, clamped away from acos singularities
+    # Use wider margin (1e-4) — acos gradient blows up well before ±1.0
+    cos = (x_unit * y_unit).sum(-1).clamp(-1.0 + 1e-4, 1.0 - 1e-4)
+
+    # Optional: skip near-zero pixels entirely
+    valid = (x_norm_val.squeeze(-1) > eps) & (y_norm_val.squeeze(-1) > eps)
+
+    sam_map = torch.acos(cos)
+
+    if valid.any():
+        return sam_map[valid].mean()
+    else:
+        return torch.tensor(0.0, device=x.device, requires_grad=True)
+
+        
+def cosine_schedule_with_warmup(
+    step: int,
+    max_steps: int,
+    max_value: float,
+    warmup_ratio: float = 0.10,
+):
+    """
+    Cosine ramp-up schedule with an initial zero region.
+
     Args:
-        x, y works for any leading dims (B,H,W,BANDS)
+        step: Current training step.
+        max_steps: Total training steps.
+        max_value: Final maximum value reached at the end.
+        warmup_ratio: Fraction of training with zero weight.
+
     Returns:
-        angle in radians [...] — mean over all pixels as scalar if reduce=True
+        Scheduled scalar value.
     """
 
-    # F.normalize is safer + faster than manual norm division
-    # it handles zero vectors gracefully
-    x_norm = F.normalize(x, p=2, dim=-1)  # [..., C]
-    y_norm = F.normalize(y, p=2, dim=-1)  # [..., C]
+    warmup_steps = int(max_steps * warmup_ratio)
 
-    # clamp is still needed for float precision at ±1
-    cos = (x_norm * y_norm).sum(-1).clamp(-1.0 + eps, 1.0 - eps)
-    sam_map = torch.acos(cos) #radians
-    return sam_map.mean()
+    # Free region (no loss contribution)
+    if step < warmup_steps:
+        return 0.0
+
+    # Normalize progress after warmup
+    progress = (step - warmup_steps) / (max_steps - warmup_steps)
+    progress = max(0.0, min(1.0, progress))
+
+    # Cosine ramp-up
+    return max_value * 0.5 * (1.0 - math.cos(math.pi * progress))
 
 def spectral_kl_loss(
     X_gt: torch.Tensor,     # (H, W, B)

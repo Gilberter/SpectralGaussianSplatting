@@ -37,9 +37,8 @@ def main():
     # Shape: [num_endmembers, num_bands]
     endmembers = ckpt["endmembers"]
 
-    # Convert to reflectance domain
-    # because training used softplus()
-    endmembers = torch.nn.functional.softplus(endmembers)
+ 
+    endmembers = torch.nn.functional.sigmoid(endmembers)
 
     endmembers = endmembers.detach().cpu().numpy()
 

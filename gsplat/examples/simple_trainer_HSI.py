@@ -31,7 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, RootMeanSquaredErrorUsingSlidingWindow, SpectralAngleMapper
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, spectral_angle_mapper, _apply_colormap, WavelengthEncoder, spectral_kl_loss, NaiveHSIUnmixer
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, spectral_angle_mapper, _apply_colormap, WavelengthEncoder, spectral_kl_loss, NaiveHSIUnmixer, cosine_schedule_with_warmup
 from utils_color import spectrum_to_rgb
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -41,6 +41,10 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+import skimage.segmentation as skiseg
+
+import matplotlib.pyplot as plt
+
 
 from gsplat.cuda._torch_impl import _spherical_harmonics_hs
 
@@ -261,6 +265,8 @@ class Config:
     ae_height:int = 512
     ae_weight:int = 512
     init_mode: str = "random" # random or kmeans
+
+    sam_lambda:float = 0.01
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -747,9 +753,8 @@ class Runner:
                 sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
 
             elif self.cfg.ae_opt:
-                # sigmoid → values in (0,1), shape [N, M]
-                # Rasterizer will alpha-composite these into [C, H, W, M]   
-                colors = torch.sigmoid(self.splats["abundances"])  # [N, M]
+                # Rasterizer will alpha-composite these into [C, H, W, B]   
+                colors = torch.softmax(self.splats["abundances"], dim=-1)  # [N, B] Bands
                 sh_degree_for_render = kwargs.pop("sh_degree", None)
                 sh_degree_for_render = None  # no SH on abundance channels
             else:
@@ -989,30 +994,13 @@ class Runner:
             )
 
             if cfg.ae_opt and self.endmembers is not None:
-                # rendered: [C, H, W, M]
-                # E:        [M, B]  (apply softplus for non-negativity)
-                E = torch.nn.functional.softplus(self.endmembers).to(renders.device)  # [M, B]
-                E = E.clamp(max=10.0)
-                # einsum is clearest; equivalent to rendered.reshape(-1,M) @ E reshaped back
-
-                abundances = renders / (renders.sum(dim=-1, keepdim=True) + 1e-8)
-                # abundances = torch.nn.softmax(renders, dim=-1)
-
+                # rendered: [C, H, W, B]
+                # E:        [M, B]  
+                E = torch.nn.functional.sigmoid(self.endmembers).to(renders.device)  # [M, B]
                 colors = torch.einsum("chwm,mb->chwb", renders, E).clamp(0.0, 1.0) # [C, H, W, B]
-                # Optional: clamp to [0,1] — sigmoid on abundances + softplus on E
-                # can produce values > 1 if E values are large
-                colors = torch.nan_to_num(colors, nan=0.0, posinf=1.0, neginf=0.0)
 
             else:
                 colors = renders  # [C, H, W, B] original path
-            
-            if not torch.isfinite(colors).all():
-                print(f"[WARN] step {step}: non-finite colors, skipping")
-                for opt in self.optimizers.values():
-                    opt.zero_grad(set_to_none=True)
-                if self.endmembers_optimizer is not None:
-                    self.endmembers_optimizer.zero_grad(set_to_none=True)
-                continue
             
             depths = None
                         
@@ -1082,13 +1070,15 @@ class Runner:
             if cfg.kl_loss:
                 loss += klloss * 1e-3
             
-            samloss = None
             if cfg.sam_loss:
-                samloss = spectral_angle_mapper(colors,pixels) 
-
-            if cfg.sam_loss:
-                loss += samloss * 1e-3
-
+                sam_lambda = cosine_schedule_with_warmup(
+                    step=step,
+                    max_steps=cfg.max_steps,
+                    max_value=cfg.sam_lambda,
+                    warmup_ratio=0.10,
+                )
+                samloss = spectral_angle_mapper(colors, pixels)
+                loss = loss + sam_lambda * samloss
             # OPTIONAL DEPTH LOSS
 
 
@@ -1128,13 +1118,13 @@ class Runner:
             loss.backward() # backward pass
 
 
-            torch.nn.utils.clip_grad_norm_(
-                list(self.splats.parameters()), max_norm=1.0
-            )
-            if self.endmembers is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    [self.endmembers], max_norm=1.0
-                )
+            # torch.nn.utils.clip_grad_norm_(
+            #     list(self.splats.parameters()), max_norm=1.0
+            # )
+            # if self.endmembers is not None:
+            #     torch.nn.utils.clip_grad_norm_(
+            #         [self.endmembers], max_norm=1.0
+            #     )
 
             desc = f"loss={loss.item():.3f}| ssim= {ssimloss} l1loss = {l1loss} "
             if cfg.depth_loss:
@@ -1318,13 +1308,10 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
-
             
             if self.endmembers_optimizer is not None:
                 self.endmembers_optimizer.step()
                 self.endmembers_optimizer.zero_grad(set_to_none=True)
-                with torch.no_grad():
-                    self.endmembers.clamp_(-10.0, 10.0)
 
             # Run post-backward steps after backward and optimizer
             # Adaptive part of Gaussian Splatting
@@ -1376,332 +1363,278 @@ class Runner:
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
-        """Entry for evaluation."""
-        #print("Running evaluation...")
-        cfg = self.cfg
-        device = self.device
+        cfg        = self.cfg
+        device     = self.device
         world_rank = self.world_rank
-        world_size = self.world_size
 
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True,
         )
+
         ellipse_time = 0
-        # Separate metric buckets
+        metric_psnr, metric_ssim, metric_lpips = [], [], []
+        endmembers_cpu = None                          # populated on first ae_opt pass
 
-        metric_psnr = []
-        metric_ssim = []
-        metric_lpips = []
+        PALETTE = np.array([
+            [ 78, 140, 230],  # blue
+            [230, 100,  80],  # coral
+            [ 60, 190, 130],  # teal
+            [200, 100, 200],  # purple
+            [245, 166,  35],  # amber
+            [ 80, 200,  80],  # green
+            [230,  60, 120],  # pink
+            [120, 120, 120],  # gray
+        ], dtype=np.uint8)
 
-        os.makedirs(f"{cfg.result_dir}/rgb", exist_ok=True)
-        os.makedirs(f"{cfg.result_dir}/hsi", exist_ok=True)
+        def seg_color(seg, palette):
+            out = np.zeros((*seg.shape, 3), dtype=np.uint8)
+            for m in range(len(palette)):
+                out[seg == m] = palette[m % len(palette)]
+            return out
+
+        os.makedirs(f"{cfg.result_dir}/rgb",          exist_ok=True)
+        os.makedirs(f"{cfg.result_dir}/hsi",          exist_ok=True)
+        os.makedirs(f"{cfg.result_dir}/segmentation", exist_ok=True)
+
         for i, data in enumerate(valloader):
 
             camtoworlds = data["camtoworld"].to(device)
-            Ks = data["K"].to(device)
-            spectrum_gt = data["image"].to(device) 
-            masks = data["mask"].to(device) if "mask" in data else None
+            Ks          = data["K"].to(device)
+            spectrum_gt = data["image"].to(device)          # [1,H,W,Bands]
+            masks       = data["mask"].to(device) if "mask" in data else None
             height, width = spectrum_gt.shape[1:3]
 
-            assert spectrum_gt.ndim == 4, (
-                f"spectrum_gt must be [B,H,W,C], got {spectrum_gt.shape}"
-            )
+            assert spectrum_gt.ndim == 4,                          f"spectrum_gt must be [B,H,W,C], got {spectrum_gt.shape}"
+            assert spectrum_gt.shape[0] == 1,                      f"Batch size must be 1, got {spectrum_gt.shape[0]}"
+            assert torch.isfinite(spectrum_gt).all(),              "spectrum_gt contains NaN or Inf"
+            assert spectrum_gt.shape[-1] == cfg.num_spectral_bands, f"Expected {cfg.num_spectral_bands} bands, got {spectrum_gt.shape[-1]}"
 
-            assert spectrum_gt.shape[0] == 1, (
-                f"Batch size must be 1, got {spectrum_gt.shape[0]}"
-            )
-
-            assert torch.isfinite(spectrum_gt).all(), (
-                "spectrum_gt contains NaN or Inf"
-            )
-
-            assert spectrum_gt.shape[-1] == cfg.num_spectral_bands, (
-                f"Expected {cfg.num_spectral_bands} spectral bands, "
-                f"got {spectrum_gt.shape[-1]}"
-            )
-
+            # ------------------------------------------------------------------ #
+            # RASTERIZE                                                            #
+            # ------------------------------------------------------------------ #
             tic = time.time()
-            spectrum_pre, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                masks=masks,
-            )  # [1, H, W, Bands] 
 
+            abundances, _, _ = self.rasterize_splats(   # [1,H,W,M]  (raw splat output)
+                camtoworlds=camtoworlds, Ks=Ks,
+                width=width, height=height,
+                near_plane=cfg.near_plane, far_plane=cfg.far_plane,
+                masks=masks,
+            )
+
+            # ------------------------------------------------------------------ #
+            # SEGMENTATION  (GPU, before einsum — abundances still in [1,H,W,M]) #
+            # ------------------------------------------------------------------ #
             if cfg.ae_opt and self.endmembers is not None:
 
-                E_raw = self.endmembers
-                E     = torch.nn.functional.softplus(E_raw).to(spectrum_pre.device)
-                E = E.clamp(max=10.0)
-            
-                # ── Diagnostic: rendered_pre ──────────────────────────────────────────
-                r_nan  = torch.isnan(spectrum_pre).sum().item()
-                r_inf  = torch.isinf(spectrum_pre).sum().item()
-                r_min  = spectrum_pre.min().item()
-                r_max  = spectrum_pre.max().item()
-                print(f"[DIAG] spectrum_pre  | nan={r_nan}  inf={r_inf}  min={r_min:.4f}  max={r_max:.4f}  shape={tuple(spectrum_pre.shape)}")
-            
-                # ── Diagnostic: E ─────────────────────────────────────────────────────
-                e_nan  = torch.isnan(E).sum().item()
-                e_inf  = torch.isinf(E).sum().item()
-                e_min  = E.min().item()
-                e_max  = E.max().item()
-                e_raw_min = E_raw.min().item()
-                e_raw_max = E_raw.max().item()
-                print(f"[DIAG] E (softplus)  | nan={e_nan}  inf={e_inf}  min={e_min:.4f}  max={e_max:.4f}")
-                print(f"[DIAG] E_raw         | min={e_raw_min:.4f}  max={e_raw_max:.4f}")
-            
-                # # ── Diagnostic: alphas ────────────────────────────────────────────────
-                # a_nan = torch.isnan(render_alphas_pre).sum().item()  # use whatever your alpha var is named
-                # a_min = render_alphas_pre.min().item()
-                # a_max = render_alphas_pre.max().item()
-                # print(f"[DIAG] render_alphas | nan={a_nan}  min={a_min:.4f}  max={a_max:.4f}")
-            
-                # ── Safe einsum ───────────────────────────────────────────────────────
-                rendered_clean = torch.nan_to_num(spectrum_pre, nan=0.0, posinf=1.0, neginf=0.0)
-                spectrum_pre   = torch.einsum("chwm,mb->chwb", rendered_clean, E).clamp(0.0, 1.0)
-                spectrum_pre   = torch.nan_to_num(spectrum_pre, nan=0.0, posinf=1.0, neginf=0.0)
-            
-                # ── Diagnostic: output ────────────────────────────────────────────────
-                o_nan = torch.isnan(spectrum_pre).sum().item()
-                o_inf = torch.isinf(spectrum_pre).sum().item()
-                print(f"[DIAG] spectrum_pre  | nan={o_nan}  inf={o_inf}  min={spectrum_pre.min():.4f}  max={spectrum_pre.max():.4f}")
-            
-                # ── Per-channel NaN check on E ────────────────────────────────────────
-                if e_nan > 0 or e_inf > 0:
-                    for m in range(E.shape[0]):
-                        print(f"[DIAG]   E[{m}] nan={torch.isnan(E[m]).sum().item()}  "
-                            f"inf={torch.isinf(E[m]).sum().item()}  "
-                            f"min={E[m].min().item():.4f}  max={E[m].max().item():.4f}")
-            
-                # ── Per-channel NaN check on rendered_pre ─────────────────────────────
-                if r_nan > 0 or r_inf > 0:
-                    C, H, W, M = spectrum_pre.shape
-                    for m in range(M):
-                        ch = spectrum_pre[..., m]
-                        print(f"[DIAG]   rendered[...,{m}] nan={torch.isnan(ch).sum().item()}  "
-                            f"inf={torch.isinf(ch).sum().item()}  "
-                            f"min={ch.min().item():.4f}  max={ch.max().item():.4f}")
-            
+                E = torch.sigmoid(self.endmembers).to(device)      # [M, Bands]
+
+                # softmax over endmember dim → proper mixing fractions [1,H,W,M]
+                ab_gpu  = torch.softmax(abundances, dim=-1)
+                seg_gpu = torch.argmax(ab_gpu, dim=-1)             # [1,H,W]  int64
+                conf_gpu = ab_gpu.max(dim=-1).values               # [1,H,W]  float
+
+                # pull to CPU only once, as contiguous uint8/float32
+                ab_np   = ab_gpu[0].cpu().numpy().astype(np.float32)   # [H,W,M]
+                seg_np  = seg_gpu[0].cpu().numpy().astype(np.int32)    # [H,W]
+                conf_np = conf_gpu[0].cpu().numpy().astype(np.float32) # [H,W]
+
+                M = cfg.num_endmembers
+
+                # reconstruct spectrum on GPU
+                spectrum_pre = torch.einsum("chwm,mb->chwb", abundances, E)
+
+                print(f"[ae] abundances [{abundances.min():.3f}, {abundances.max():.3f}]  "
+                    f"E [{E.min():.3f}, {E.max():.3f}]  "
+                    f"spectrum_pre [{spectrum_pre.min():.3f}, {spectrum_pre.max():.3f}]")
+
             else:
-                spectrum_pre = spectrum_pre
-    
+                spectrum_pre = abundances                          # passthrough
+                ab_np = seg_np = conf_np = None
+                M = 0
+
             ellipse_time += max(time.time() - tic, 1e-10)
 
-           # mask = masks.detach().cpu().permute(1,2,0)
-
+            # ------------------------------------------------------------------ #
+            # METRICS + SAVING  (rank 0 only)                                     #
+            # ------------------------------------------------------------------ #
             if world_rank == 0:
-                # FOR HSI USING THE FUNCTION SPECTRUM_TO_RGB
 
-                assert spectrum_pre.ndim == 4, (
-                    f"spectrum_pre must be [B,H,W,C], got {spectrum_pre.shape}"
-                )
+                assert spectrum_pre.ndim == 4,                              f"spectrum_pre must be [B,H,W,C], got {spectrum_pre.shape}"
+                assert spectrum_pre.shape == spectrum_gt.shape,             f"Shape mismatch: {spectrum_pre.shape} vs {spectrum_gt.shape}"
+                assert torch.isfinite(spectrum_pre).all(),                  "spectrum_pre contains NaN or Inf"
 
-                assert spectrum_pre.shape == spectrum_gt.shape, (
-                    f"Prediction shape mismatch: "
-                    f"{spectrum_pre.shape} vs {spectrum_gt.shape}"
-                )
-
-                assert torch.isfinite(spectrum_pre).all(), (
-                    "spectrum_pre contains NaN or Inf"
-                )
-                
-                print(f"ANTES spectrum_pre range: [{spectrum_pre.min():.4f}, {spectrum_pre.max():.4f}]")
-
-
+                # normalise to [0,1] on GPU
                 if spectrum_gt.max() > 1:
-                    spectrum_gt = spectrum_gt / spectrum_gt.max().clamp(min=1e-8)
-                    spectrum_gt = torch.clamp(spectrum_gt,0.0,1.0)
-
+                    spectrum_gt = (spectrum_gt / spectrum_gt.max().clamp(min=1e-8)).clamp(0, 1)
                 if spectrum_pre.max() > 1:
-                    spectrum_pre = spectrum_pre / spectrum_pre.max().clamp(min=1e-8)
-                    spectrum_pre = torch.clamp(spectrum_pre,0.0,1.0)
+                    spectrum_pre = (spectrum_pre / spectrum_pre.max().clamp(min=1e-8)).clamp(0, 1)
 
-                # change the RGB and Hyperspectral setup
-                spectrum_pre = torch.clamp(spectrum_pre,0,1).contiguous().permute(0,3,1,2)
-                spectrum_gt = torch.clamp(spectrum_gt,0,1).contiguous().permute(0,3,1,2)
+                # [1,H,W,C] → [1,C,H,W]  for torchmetrics / spectrum_to_rgb
+                spectrum_pre = spectrum_pre.clamp(0, 1).permute(0, 3, 1, 2).contiguous()
+                spectrum_gt  = spectrum_gt.clamp(0, 1).permute(0, 3, 1, 2).contiguous()
 
-                print(f"DESPUES spectrum_pre range: [{spectrum_pre.min():.4f}, {spectrum_pre.max():.4f}]")
-                
-                rgb_pre = spectrum_to_rgb(spectrum_pre, start=450, end=650, bands=cfg.num_spectral_bands).permute(0,3,1,2)
-                rgb_gt = spectrum_to_rgb(spectrum_gt, start=450, end=650, bands=cfg.num_spectral_bands).permute(0,3,1,2)
+                rgb_pre = spectrum_to_rgb(spectrum_pre, start=450, end=650,
+                                        bands=cfg.num_spectral_bands).permute(0, 3, 1, 2)
+                rgb_gt  = spectrum_to_rgb(spectrum_gt,  start=450, end=650,
+                                        bands=cfg.num_spectral_bands).permute(0, 3, 1, 2)
 
+                assert rgb_pre.shape[1] == 3, f"RGB pred must have 3 channels, got {rgb_pre.shape}"
+                assert rgb_gt.shape[1]  == 3, f"RGB GT must have 3 channels, got {rgb_gt.shape}"
+                assert torch.isfinite(rgb_pre).all(), "rgb_pre contains NaN or Inf"
+                assert torch.isfinite(rgb_gt).all(),  "rgb_gt contains NaN or Inf"
 
-
-                assert rgb_pre.ndim == 4
-                assert rgb_gt.ndim == 4
-
-                assert rgb_pre.shape[1] == 3, (
-                    f"RGB prediction must have 3 channels, got {rgb_pre.shape}"
-                )
-
-                assert rgb_gt.shape[1] == 3, (
-                    f"RGB GT must have 3 channels, got {rgb_gt.shape}"
-                )
-
-                assert torch.isfinite(rgb_pre).all(), (
-                    "rgb_pre contains NaN or Inf"
-                )
-
-                assert torch.isfinite(rgb_gt).all(), (
-                    "rgb_gt contains NaN or Inf"
-                )
-                
-
-                spectrum_pre_cpu = spectrum_pre.detach().cpu()
-                spectrum_gt_cpu = spectrum_gt.detach().cpu()
-                rgb_pre_cpu = rgb_pre.detach().cpu()
-                rgb_gt_cpu = rgb_gt.detach().cpu()
-                
-
-                # METRICS INSIDE THE GPU FOR THE TENSOR IN PYTORCH CURRENT GRAPH
-
+                # metrics on GPU
                 metric_psnr.append((i, self.psnr(spectrum_gt, spectrum_pre).item()))
                 metric_ssim.append((i, self.ssim(spectrum_gt, spectrum_pre).item()))
                 metric_lpips.append((i, self.lpips(rgb_gt, rgb_pre).item()))
 
-                ## RGB SAVING NUMPY
+                # pull to CPU once
+                spectrum_pre_cpu = spectrum_pre.cpu()
+                spectrum_gt_cpu  = spectrum_gt.cpu()
+                rgb_pre_cpu      = rgb_pre.cpu()
+                rgb_gt_cpu       = rgb_gt.cpu()
 
-                rgb_pred_np = (
-                    rgb_pre_cpu[0]
-                    .permute(1, 2, 0)
-                    .numpy()
-                )
+                rgb_pred_np = (rgb_pre_cpu[0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                rgb_gt_np   = (rgb_gt_cpu[0].permute(1, 2, 0).numpy()  * 255).astype(np.uint8)
 
-                rgb_gt_np = (
-                    rgb_gt_cpu[0]
-                    .permute(1, 2, 0)
-                    .numpy()
-                )
+                if cfg.ae_opt and self.endmembers is not None:
+                    endmembers_cpu = torch.sigmoid(self.endmembers).detach().cpu().numpy()  # [M,Bands]
 
-                rgb_pred_np = (rgb_pred_np * 255).astype(np.uint8)
-                rgb_gt_np = (rgb_gt_np * 255).astype(np.uint8)
-
-
-
-
-                rgb_canvas = np.concatenate(
-                    [
-                        rgb_gt_np,
-                        rgb_pred_np
-                    ],
-                    axis=1,
-                )
-
-
-
+                # -------------------------------------------------------------- #
+                # RGB canvas                                                       #
+                # -------------------------------------------------------------- #
                 imageio.imwrite(
-                    os.path.join(
-                        f"{cfg.result_dir}/rgb",
-                        f"{stage}_step{step:04d}_{i:04d}.png"
-                    ),
-                    rgb_canvas,
+                    os.path.join(f"{cfg.result_dir}/rgb",
+                                f"{stage}_step{step:04d}_{i:04d}.png"),
+                    np.concatenate([rgb_gt_np, rgb_pred_np], axis=1),
                 )
 
-
-                # Hyperspectral  SAVING NUMPY
-
-                B = spectrum_pre.shape[1]
-                
-                band_indices = {
-                    "band_short": 0,
-                    "band_mid":   B // 2,
-                    "band_long":  B - 1,
-                }
-
+                # -------------------------------------------------------------- #
+                # HSI bands canvas                                                 #
+                # -------------------------------------------------------------- #
+                B = spectrum_pre_cpu.shape[1]
                 band_rows = []
-
-                for band_name, b_idx in band_indices.items():
-                    
-                    # GT BAND
-                    gt_band = (
-                        spectrum_gt_cpu[0, b_idx]
-                        .numpy()
-                    )
-                    # PRED BAND
-                    pred_band = (
-                        spectrum_pre_cpu[0, b_idx]
-                        .numpy()
-                    )
-                   
-                    gt_cm = _apply_colormap(
-                        gt_band,
-                        cmap="magma",
-                    )
-
-                    pred_cm = _apply_colormap(
-                        pred_band,
-                        cmap="magma",
-                    )
-
-                    row = np.concatenate(
-                        [
-                            gt_cm,
-                            pred_cm
-                        ],
-                        axis=1,
-                    )
-
-                    band_rows.append(row)
-
-                hsi_canvas = np.concatenate(
-                    band_rows,
-                    axis=0,
-                )
+                for b_idx in [0, B // 2, B - 1]:
+                    gt_cm   = _apply_colormap(spectrum_gt_cpu[0, b_idx].numpy(),  cmap="magma")
+                    pred_cm = _apply_colormap(spectrum_pre_cpu[0, b_idx].numpy(), cmap="magma")
+                    band_rows.append(np.concatenate([gt_cm, pred_cm], axis=1))
 
                 imageio.imwrite(
-                    os.path.join(
-                        f"{cfg.result_dir}/hsi",
-                        f"{stage}_step{step:04d}_{i:04d}.png"
-                    ),
-                    hsi_canvas,
+                    os.path.join(f"{cfg.result_dir}/hsi",
+                                f"{stage}_step{step:04d}_{i:04d}.png"),
+                    np.concatenate(band_rows, axis=0),
                 )
 
-            del spectrum_pre
-            del spectrum_gt
-            del rgb_pre
-            del rgb_gt
+                # -------------------------------------------------------------- #
+                # SEGMENTATION outputs (only when ae_opt is active)               #
+                # -------------------------------------------------------------- #
+                if cfg.ae_opt and seg_np is not None:
 
-        psnr_values = [item[1] for item in metric_psnr]
-        ssim_values = [item[1] for item in metric_ssim]
-        lpips_values = [item[1] for item in metric_lpips]
+                    prefix = os.path.join(f"{cfg.result_dir}/segmentation",
+                                        f"{stage}_step{step:04d}_{i:04d}")
+
+                    # --- opt 1: boundary overlay on RGB GT ---
+                    opt1 = rgb_gt_np.copy()
+                    for m in range(M):
+                        bnd = skiseg.find_boundaries(seg_np == m, mode="outer")
+                        opt1[bnd] = PALETTE[m % len(PALETTE)]
+                    imageio.imwrite(f"{prefix}_opt1_boundary.png", opt1)
+
+                    # --- opt 2: soft abundance blend over RGB GT ---
+                    base  = rgb_gt_np.astype(np.float32) / 255.0
+                    blend = np.zeros_like(base)
+                    for m in range(M):
+                        c = PALETTE[m % len(PALETTE)].astype(np.float32) / 255.0
+                        blend += ab_np[:, :, m, None] * c
+                    alpha = conf_np[:, :, None]
+                    opt2  = np.clip((1 - alpha * 0.5) * base + (alpha * 0.5) * blend, 0, 1)
+                    imageio.imwrite(f"{prefix}_opt2_blend.png",
+                                    (opt2 * 255).astype(np.uint8))
+
+                    # --- opt 3: three-panel RGB | seg | confidence + legend ---
+                    seg_colored = seg_color(seg_np, PALETTE)
+                    conf_norm   = (conf_np - conf_np.min()) / (conf_np.max() - conf_np.min() + 1e-8)
+                    conf_cm     = (plt.cm.cividis(conf_norm)[:, :, :3] * 255).astype(np.uint8)
+                    div         = np.full((seg_np.shape[0], 2, 3), 200, dtype=np.uint8)
+                    panel3      = np.concatenate([rgb_gt_np, div, seg_colored, div, conf_cm], axis=1)
+
+                    H_p, W_p = panel3.shape[:2]
+                    bar_h = max(28, H_p // 14)
+                    bar   = np.full((bar_h, W_p, 3), 240, dtype=np.uint8)
+                    bw    = seg_np.shape[1] // M
+
+                    fig3, ax3 = plt.subplots(figsize=(W_p / 100, (H_p + bar_h) / 100), dpi=100)
+                    ax3.imshow(np.concatenate([panel3, bar], axis=0))
+                    ax3.axis("off")
+                    for m in range(M):
+                        bar[:, m*bw : (m+1)*bw if m < M-1 else W_p] = PALETTE[m % len(PALETTE)]
+                        luma = 0.299*PALETTE[m,0] + 0.587*PALETTE[m,1] + 0.114*PALETTE[m,2]
+                        ax3.text((m + 0.5) * bw, H_p + bar_h / 2, f"EM {m+1}",
+                                color="black" if luma > 128 else "white",
+                                fontsize=7, ha="center", va="center", fontweight="bold")
+                    fig3.tight_layout(pad=0)
+                    fig3.savefig(f"{prefix}_opt3_panel.png",
+                                dpi=100, bbox_inches="tight", pad_inches=0)
+                    plt.close(fig3)
+
+                    # --- opt 4: per-endmember masked RGB grid ---
+                    cols    = min(4, M)
+                    rows    = (M + cols - 1) // cols
+                    H_i, W_i = rgb_gt_np.shape[:2]
+                    canvas4 = np.zeros((H_i * rows, W_i * cols, 3), dtype=np.uint8)
+                    for m in range(M):
+                        masked = rgb_gt_np.copy()
+                        masked[seg_np != m] = 0
+                        r, c = divmod(m, cols)
+                        canvas4[r*H_i:(r+1)*H_i, c*W_i:(c+1)*W_i] = masked
+                    imageio.imwrite(f"{prefix}_opt4_masked.png", canvas4)
+
+                    print(f"[seg] saved 4 segmentation outputs → {cfg.result_dir}/segmentation/")
+
+            del spectrum_pre, spectrum_gt, rgb_pre, rgb_gt
+
+        # ---------------------------------------------------------------------- #
+        # ENDMEMBER PLOT  (after loop)                                            #
+        # ---------------------------------------------------------------------- #
+        if endmembers_cpu is not None:
+            wavelengths_np = np.linspace(450, 650, cfg.num_spectral_bands)
+            fig, ax = plt.subplots(figsize=(10, 6))
+            for em_idx in range(cfg.num_endmembers):
+                ax.plot(wavelengths_np, endmembers_cpu[em_idx],
+                        linewidth=2, label=f"Endmember {em_idx+1}")
+            ax.set_xlabel("Wavelength (nm)")
+            ax.set_ylabel("Reflectance / Intensity")
+            ax.set_title("Spectral Signatures of Learned Endmembers")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            fig.tight_layout()
+            os.makedirs(f"{cfg.result_dir}/endmembers", exist_ok=True)
+            save_path = os.path.join(f"{cfg.result_dir}/endmembers",
+                                    f"{stage}_step{step:04d}_endmembers.png")
+            fig.savefig(save_path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved endmember plot to: {save_path}")
+
+        # ---------------------------------------------------------------------- #
+        # METRICS JSON                                                             #
+        # ---------------------------------------------------------------------- #
+        psnr_values  = [v for _, v in metric_psnr]
+        ssim_values  = [v for _, v in metric_ssim]
+        lpips_values = [v for _, v in metric_lpips]
 
         metrics_dict = {
-            "psnr_mean": float(np.mean(psnr_values)),
-            "psnr_std": float(np.std(psnr_values)),
-
-            "ssim_mean": float(np.mean(ssim_values)),
-            "ssim_std": float(np.std(ssim_values)),
-
-            "lpips_mean": float(np.mean(lpips_values)),
-            "lpips_std": float(np.std(lpips_values)),
-
+            "psnr_mean":  float(np.mean(psnr_values)),  "psnr_std":  float(np.std(psnr_values)),
+            "ssim_mean":  float(np.mean(ssim_values)),  "ssim_std":  float(np.std(ssim_values)),
+            "lpips_mean": float(np.mean(lpips_values)), "lpips_std": float(np.std(lpips_values)),
             "num_samples": len(metric_psnr),
-
-            "per_image": {
-                "psnr": metric_psnr,
-                "ssim": metric_ssim,
-                "lpips": metric_lpips,
-            },
-
+            "per_image": {"psnr": metric_psnr, "ssim": metric_ssim, "lpips": metric_lpips},
             "ellipse_time_seconds": float(ellipse_time),
         }
 
-        json_path = os.path.join(
-            self.render_dir,
-            f"{stage}_step{step:04d}_metrics.json"
-        )
-
+        json_path = os.path.join(self.render_dir, f"{stage}_step{step:04d}_metrics.json")
         with open(json_path, "w") as f:
-            json.dump(
-                metrics_dict,
-                f,
-                indent=4,
-            )
-          
+            json.dump(metrics_dict, f, indent=4)
+
 
     @torch.no_grad()
     def render_traj(self, step: int):

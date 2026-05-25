@@ -489,6 +489,7 @@ print_info "Final Save Steps string: $SAVE_STEPS"
     printf "%-30s %s\n" "Feature Dim:" "$FEATURE_DIM"
     printf "%-30s %s\n" "App Embed Dim:" "$APP_EMBED_DIM"
     printf "%-30s %s\n" "SSIM_LAMBDA:" "$SSIM_LAMBDA"
+    printf "%-30s %s\n" "Num Endmembers:" "$NUM_ENDMEMBERS"
 
     [ "$ABSGRAD" = true ]   && printf "%-30s %s\n" "Grow Grad2D:" "$GROW_GRAD2D"
     [ "$BILATERAL" = true ] && printf "%-30s %s\n" "Bilateral Grid Shape:" "($BILATERAL_SHAPE_X, $BILATERAL_SHAPE_Y, $BILATERAL_SHAPE_W)"
@@ -529,6 +530,7 @@ FLAGS="$FLAGS --ssim_lambda $SSIM_LAMBDA"
 #FLAGS="$FLAGS --max_gaussians $MAX_GAUSSIANS"
 FLAGS="$FLAGS --test_every $TEST_EVERY"
 
+FLAGS="$FLAGS --num_endmembers $NUM_ENDMEMBERS"
 
 
 FLAGS="$FLAGS --hyperspectral_data_dir $NPY_DIR"
