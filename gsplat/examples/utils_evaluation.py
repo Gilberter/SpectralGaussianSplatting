@@ -2,6 +2,7 @@ import os
 import numpy as np
 import cv2
 import argparse
+import torch
 
 # XYZ from chromaticity helper
 def xyz_from_xy(x,y):
@@ -150,3 +151,124 @@ def spectrum_to_rgb(spectrum, start=450, end=650, bands=21, apply_gamma=True):
         rgb = torch.from_numpy(rgb).to(device=device, dtype=dtype)
 
     return rgb
+
+class EndmemberTracker:
+
+    def __init__(self):
+        self.steps = []
+        self.history = []
+
+    @torch.no_grad()
+    def update(self, endmembers, step):
+
+        E = torch.sigmoid(
+            endmembers.detach()
+        ).float().cpu()
+
+        self.steps.append(step)
+
+        # store CPU tensor only
+        self.history.append(E)
+
+    def save(self, path, fps=2):
+        """
+        Saves:
+            - compressed history (.npz)
+            - animated gif (.gif)
+
+        history shape: [T, M, B]
+        """
+
+        from pathlib import Path
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import imageio.v2 as imageio
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # ---------------------------------------------------------
+        # SAVE RAW DATA
+        # ---------------------------------------------------------
+
+        history = torch.stack(self.history)  # [T, M, B]
+
+        np.savez_compressed(
+            str(path.with_suffix(".npz")),
+            history=history.numpy(),
+            steps=np.array(self.steps),
+        )
+
+        # ---------------------------------------------------------
+        # CREATE GIF
+        # ---------------------------------------------------------
+
+        history_np = history.numpy()
+
+        frames = []
+
+        T, M, B = history_np.shape
+
+        x = np.arange(B)
+
+        for t in range(T):
+
+            fig, ax = plt.subplots(figsize=(8, 5))
+
+            for m in range(M):
+                ax.plot(
+                    x,
+                    history_np[t, m],
+                    linewidth=2,
+                    label=f"EM {m}"
+                )
+
+            ax.set_title(f"Step {self.steps[t]}")
+            ax.set_xlabel("Band")
+            ax.set_ylabel("Reflectance")
+
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(True, alpha=0.3)
+
+            if M <= 15:
+                ax.legend()
+
+            fig.tight_layout()
+
+            # -----------------------------------------------------
+            # Convert matplotlib figure -> numpy image
+            # -----------------------------------------------------
+
+            fig.canvas.draw()
+
+            frame = np.frombuffer(
+                fig.canvas.buffer_rgba(),
+                dtype=np.uint8
+            )
+
+            frame = frame.reshape(
+                fig.canvas.get_width_height()[::-1] + (4,)
+            )
+
+            # remove alpha channel
+            frame = frame[..., :3]
+
+            frames.append(frame)
+
+            plt.close(fig)
+
+        # ---------------------------------------------------------
+        # SAVE GIF
+        # ---------------------------------------------------------
+
+        gif_path = path.with_suffix(".gif")
+
+        imageio.mimsave(
+            gif_path,
+            frames,
+            fps=fps,
+            loop=0,
+        )
+
+        print(f"Saved endmember history to: {path.with_suffix('.npz')}")
+        print(f"Saved GIF to: {gif_path}")

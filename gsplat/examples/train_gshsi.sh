@@ -95,8 +95,8 @@ if [[ ! "$DENSIFICATION" =~ ^(classic|mcmc)$ ]]; then
     exit 1
 fi
 
-if [[ ! "$RENDER" =~ ^(spectral_sh|spectral|rgb_sh|rgb)$ ]]; then
-    print_error "The rendering must be 'spectral_sh' or 'spectral' or 'rgb_sh' or 'rgb', got: $RENDER"
+if [[ ! "$RENDER" =~ ^(spectral_sh|spectral|rgb_sh|rgb|ae_opt|ae_opt_sh)$ ]]; then
+    print_error "The rendering must be 'spectral_sh' or 'spectral' or 'rgb_sh' or 'rgb' or 'ae_opt' or 'ae_opt_sh', got: $RENDER"
     exit 1
 fi
 
@@ -591,9 +591,16 @@ if [ "$RENDER" = "spectral_sh" ]; then
     FLAGS="$FLAGS --sh_hyperspectral"
 fi
 
-if [ "$AE_OPT" = true ]; then
+if [ "$RENDER" = "ae_opt_sh" ]; then
+    FLAGS="$FLAGS --ae_specular"
+    FLAGS="$FLAGS --ae_opt"
+    FLAGS="$FLAGS --sh_hyperspectral"
+fi
+
+if [ "$RENDER" = "ae_opt" ]; then
     FLAGS="$FLAGS --ae_opt"
 fi
+
 # [ "$GROUND_LOSS"    -eq 1 ] && FLAGS="$FLAGS --ground_depth_loss --ground_seg_dir $GROUND_DIR "
 
 # -------------------------

@@ -33,6 +33,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, spectral_angle_mapper, _apply_colormap, WavelengthEncoder, spectral_kl_loss, NaiveHSIUnmixer, cosine_schedule_with_warmup
 from utils_color import spectrum_to_rgb
+from utils_evaluation import EndmemberTracker
 from gsplat import export_splats
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
@@ -87,7 +88,7 @@ class Config:
 
     # Rendering Mode
 
-    rendering_mode: Literal["rgb","spectral", "rgb_sh", "spectral_sh"] = "rgb"
+    rendering_mode: Literal["rgb","spectral", "rgb_sh", "spectral_sh", "ae_opt", "ae_opt_sh"] = "rgb"
 
 
     # Port for the viewer server
@@ -257,9 +258,10 @@ class Config:
     ground_seg_dir: str = ""
     ground_depth_start_step: int = 1000
     
-    # Endmemerbs and abundances
+    # Endmembers and abundances
 
-    ae_opt:bool = False
+    ae_opt: bool = False
+    ae_specular: bool = False
     num_endmembers:int = 5
     ae_lr:float = 0.01
     ae_height:int = 512
@@ -267,6 +269,8 @@ class Config:
     init_mode: str = "random" # random or kmeans
 
     sam_lambda:float = 0.01
+
+
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -317,6 +321,7 @@ def create_splats_with_optimizers(
     use_hyperspectral:bool = True,
     sh_hyperspectral:bool = False,
     ae_opt: bool = False,
+    ae_specular: bool = False,
     num_endmembers: int = 5,
     ae_lr: float = 1e-2,
     ae_height: int = 512,
@@ -368,7 +373,7 @@ def create_splats_with_optimizers(
 
     
     if use_hyperspectral:
-        if sh_hyperspectral:
+        if sh_hyperspectral and ae_opt is False:
             #print("HYPERSPECTRAL + SH")
             bands = torch.rand((N, (sh_degree + 1) ** 2, num_spectral_bands))
             bands[:, 0, :] = rgb_to_sh(torch.full((N, num_spectral_bands), 0.5))
@@ -378,7 +383,9 @@ def create_splats_with_optimizers(
         elif ae_opt:
             abundances_init = torch.zeros(N, num_endmembers)
             params.append(("abundances", torch.nn.Parameter(abundances_init), ae_lr))
-
+            if ae_specular:
+                bands = torch.full((N, ((sh_degree + 1) ** 2)-1, num_endmembers),0.5)
+                params.append(("shN", torch.nn.Parameter(rgb_to_sh(bands[:, :, :])), shN_lr))
             endmembers = torch.nn.Parameter(
                 torch.rand(num_endmembers, num_spectral_bands)
             )
@@ -452,6 +459,7 @@ def create_splats_with_optimizers(
         # because "abundances" is a key in params and therefore in splats
  
     print(f"Splats {splats}")
+    print("Type:", type(cfg.num_endmembers), "Content:", cfg.num_endmembers)
     # splat and optimizers
     return splats, optimizers, endmembers, endmembers_optimizer
 
@@ -506,6 +514,8 @@ class Runner:
         # loss curves
         # PNSR / SSIM
         # number of splats
+        self.endmember_tracker = EndmemberTracker()
+
 
         if self.cfg.use_hyperspectral:
 
@@ -541,6 +551,8 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
 
         print("Scene scale:", self.scene_scale)
+        print("SH Degree Initialization", cfg.sh_degree)
+        print("AE Optimization ? =", cfg.ae_opt)
 
         # Model
         self.splats, self.optimizers, self.endmembers, self.endmembers_optimizer = create_splats_with_optimizers(
@@ -568,14 +580,18 @@ class Runner:
             sh_hyperspectral=cfg.sh_hyperspectral, # False 
             use_hyperspectral=cfg.use_hyperspectral, # True
             ae_opt=cfg.ae_opt,
+            ae_specular=cfg.ae_specular,
             num_endmembers=cfg.num_endmembers,
             ae_lr=cfg.ae_lr,
 
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
         if cfg.ae_opt:
-            assert not cfg.sh_hyperspectral, "Cannot run abundances/endmembers optimization with SH hyperspectral enabled!"
-            print(f"Model using Abudances and Endmembers Optimization")
+            if cfg.ae_specular:
+                print(f"Model Using SH Abudances and Endmembers Optimization")
+            else:
+                assert not cfg.sh_hyperspectral, "Cannot run abundances/endmembers optimization with SH hyperspectral enabled!"
+                print(f"Model using Abudances and Endmembers Optimization")
 
 
         # Densification Strategy
@@ -748,15 +764,21 @@ class Runner:
 
         if self.cfg.use_hyperspectral:
             # Hyperspectral
-            if self.cfg.sh_hyperspectral:
+            if self.cfg.sh_hyperspectral and cfg.ae_opt is False:
                 colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)
                 sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
 
             elif self.cfg.ae_opt:
                 # Rasterizer will alpha-composite these into [C, H, W, B]   
-                colors = torch.softmax(self.splats["abundances"], dim=-1)  # [N, B] Bands
-                sh_degree_for_render = kwargs.pop("sh_degree", None)
-                sh_degree_for_render = None  # no SH on abundance channels
+                if cfg.ae_specular:
+                    sh0 = torch.softmax(self.splats["abundances"], dim=-1).unsqueeze(1)  # [N, 1, R] R endmembers
+                    shN = torch.softmax(self.splats["shN"], dim=-1) # [N, K-1, R]
+                    colors = torch.cat([sh0, shN], 1)
+                    sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
+                else:
+                    colors = torch.softmax(self.splats["abundances"], dim=-1)  # [N, R] R endmembers
+                    sh_degree_for_render = kwargs.pop("sh_degree", None)
+                    sh_degree_for_render = None  # no SH on abundance channels
             else:
                 colors = torch.sigmoid(self.splats["spectrum"])  # [.., N, num_bands]
                 sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
@@ -840,6 +862,7 @@ class Runner:
             use_hyperspectral = cfg.use_hyperspectral,
             sh_degree = sh_degree_for_render,
             rendering_mode = self.cfg.rendering_mode,
+            num_bands=cfg.num_endmembers,
             **kwargs,
         )
         # foreground only supervision
@@ -861,6 +884,7 @@ class Runner:
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
+
 
         # Dump cfg.
         if world_rank == 0:
@@ -968,7 +992,7 @@ class Runner:
             # sh schedule
             # start with low frequency color
             # gradually add high frequency SH
-            if (cfg.sh_hyperspectral or cfg.sh_degree is not None) and not cfg.ae_opt:
+            if (cfg.sh_hyperspectral or cfg.sh_degree is not None) and cfg.ae_specular:
                 sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
                 if step % cfg.sh_degree_interval == 0:
                     print(f"Now Using SH Degree {sh_degree_to_use}/{cfg.sh_degree}")
@@ -998,6 +1022,12 @@ class Runner:
                 # E:        [M, B]  
                 E = torch.nn.functional.sigmoid(self.endmembers).to(renders.device)  # [M, B]
                 colors = torch.einsum("chwm,mb->chwb", renders, E).clamp(0.0, 1.0) # [C, H, W, B]
+
+                if step % 1000 == 0:
+                    self.endmember_tracker.update(
+                        self.endmembers,
+                        step,
+                    )
 
             else:
                 colors = renders  # [C, H, W, B] original path
@@ -1497,9 +1527,6 @@ class Runner:
                 rgb_pred_np = (rgb_pre_cpu[0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                 rgb_gt_np   = (rgb_gt_cpu[0].permute(1, 2, 0).numpy()  * 255).astype(np.uint8)
 
-                if cfg.ae_opt and self.endmembers is not None:
-                    endmembers_cpu = torch.sigmoid(self.endmembers).detach().cpu().numpy()  # [M,Bands]
-
                 # -------------------------------------------------------------- #
                 # RGB canvas                                                       #
                 # -------------------------------------------------------------- #
@@ -1524,97 +1551,311 @@ class Runner:
                                 f"{stage}_step{step:04d}_{i:04d}.png"),
                     np.concatenate(band_rows, axis=0),
                 )
-
                 # -------------------------------------------------------------- #
-                # SEGMENTATION outputs (only when ae_opt is active)               #
+                # SEGMENTATION outputs (only when ae_opt is active)              #
                 # -------------------------------------------------------------- #
                 if cfg.ae_opt and seg_np is not None:
 
-                    prefix = os.path.join(f"{cfg.result_dir}/segmentation",
-                                        f"{stage}_step{step:04d}_{i:04d}")
+                    cols = min(4, M)
+                    rows = (M + cols - 1) // cols
+                    prefix = os.path.join(
+                        f"{cfg.result_dir}/segmentation",
+                        f"{stage}_step{step:04d}_{i:04d}"
+                    )
+                    # ── helpers ──────────────────────────────────────────────────────
+                    CMAP       = plt.cm.nipy_spectral          # swap to tab20, hsv, etc.
+                    ALPHA      = 0.55                           # spectral overlay opacity
+                    BORDER_PX  = 2                              # white cell border (px)
+                    LABEL_SIZE = max(6, min(10, 90 // cols))    # auto-scale font
+                    DPI        = 150
 
-                    # --- opt 1: boundary overlay on RGB GT ---
-                    opt1 = rgb_gt_np.copy()
+                    # ── per-segment colours ──────────────────────────────────────────
+                    colors = [
+                        (np.array(CMAP(m / max(M - 1, 1))[:3]) * 255).astype(np.uint8)
+                        for m in range(M)
+                    ]
+
+                    # ── figure layout: two rows of grids (RGB top, spectral bottom)
+                    #    + one legend row at the bottom ───────────────────────────────
+                    fig = plt.figure(
+                        figsize=(cols * 2.2, rows * 2.2 * 2 + 0.9),
+                        dpi=DPI, constrained_layout=False
+                    )
+                    fig.patch.set_facecolor("#0d0d0d")
+
+                    gs = fig.add_gridspec(
+                        nrows=rows * 2 + 1,
+                        ncols=cols,
+                        hspace=0.08, wspace=0.04,
+                        height_ratios=[1] * (rows * 2) + [0.18],
+                    )
+
                     for m in range(M):
-                        bnd = skiseg.find_boundaries(seg_np == m, mode="outer")
-                        opt1[bnd] = PALETTE[m % len(PALETTE)]
-                    imageio.imwrite(f"{prefix}_opt1_boundary.png", opt1)
-
-                    # --- opt 2: soft abundance blend over RGB GT ---
-                    base  = rgb_gt_np.astype(np.float32) / 255.0
-                    blend = np.zeros_like(base)
-                    for m in range(M):
-                        c = PALETTE[m % len(PALETTE)].astype(np.float32) / 255.0
-                        blend += ab_np[:, :, m, None] * c
-                    alpha = conf_np[:, :, None]
-                    opt2  = np.clip((1 - alpha * 0.5) * base + (alpha * 0.5) * blend, 0, 1)
-                    imageio.imwrite(f"{prefix}_opt2_blend.png",
-                                    (opt2 * 255).astype(np.uint8))
-
-                    # --- opt 3: three-panel RGB | seg | confidence + legend ---
-                    seg_colored = seg_color(seg_np, PALETTE)
-                    conf_norm   = (conf_np - conf_np.min()) / (conf_np.max() - conf_np.min() + 1e-8)
-                    conf_cm     = (plt.cm.cividis(conf_norm)[:, :, :3] * 255).astype(np.uint8)
-                    div         = np.full((seg_np.shape[0], 2, 3), 200, dtype=np.uint8)
-                    panel3      = np.concatenate([rgb_gt_np, div, seg_colored, div, conf_cm], axis=1)
-
-                    H_p, W_p = panel3.shape[:2]
-                    bar_h = max(28, H_p // 14)
-                    bar   = np.full((bar_h, W_p, 3), 240, dtype=np.uint8)
-                    bw    = seg_np.shape[1] // M
-
-                    fig3, ax3 = plt.subplots(figsize=(W_p / 100, (H_p + bar_h) / 100), dpi=100)
-                    ax3.imshow(np.concatenate([panel3, bar], axis=0))
-                    ax3.axis("off")
-                    for m in range(M):
-                        bar[:, m*bw : (m+1)*bw if m < M-1 else W_p] = PALETTE[m % len(PALETTE)]
-                        luma = 0.299*PALETTE[m,0] + 0.587*PALETTE[m,1] + 0.114*PALETTE[m,2]
-                        ax3.text((m + 0.5) * bw, H_p + bar_h / 2, f"EM {m+1}",
-                                color="black" if luma > 128 else "white",
-                                fontsize=7, ha="center", va="center", fontweight="bold")
-                    fig3.tight_layout(pad=0)
-                    fig3.savefig(f"{prefix}_opt3_panel.png",
-                                dpi=100, bbox_inches="tight", pad_inches=0)
-                    plt.close(fig3)
-
-                    # --- opt 4: per-endmember masked RGB grid ---
-                    cols    = min(4, M)
-                    rows    = (M + cols - 1) // cols
-                    H_i, W_i = rgb_gt_np.shape[:2]
-                    canvas4 = np.zeros((H_i * rows, W_i * cols, 3), dtype=np.uint8)
-                    for m in range(M):
-                        masked = rgb_gt_np.copy()
-                        masked[seg_np != m] = 0
+                        mask = (seg_np == m)
+                        pixel_count = mask.sum()
                         r, c = divmod(m, cols)
-                        canvas4[r*H_i:(r+1)*H_i, c*W_i:(c+1)*W_i] = masked
-                    imageio.imwrite(f"{prefix}_opt4_masked.png", canvas4)
 
-                    print(f"[seg] saved 4 segmentation outputs → {cfg.result_dir}/segmentation/")
+                        # ── skip truly empty segments ─────────────────────────────
+                        if pixel_count == 0:
+                            for row_offset in (0, rows):
+                                ax = fig.add_subplot(gs[r + row_offset, c])
+                                ax.set_visible(False)
+                            continue
+
+                        pct   = 100 * pixel_count / seg_np.size
+                        color = colors[m]
+                        hex_c = "#{:02X}{:02X}{:02X}".format(*color)
+
+                        # ── RGB masked ───────────────────────────────────────────
+                        masked = rgb_gt_np.copy()
+                        masked[~mask] = 0
+                        ax_rgb = fig.add_subplot(gs[r, c])
+                        ax_rgb.imshow(masked)
+
+                        # white border around each cell
+                        for spine in ax_rgb.spines.values():
+                            spine.set_edgecolor("white")
+                            spine.set_linewidth(BORDER_PX / 2)
+
+                        ax_rgb.set_xticks([]); ax_rgb.set_yticks([])
+                        ax_rgb.set_title(
+                            f"seg {m}  •  {pct:.1f}%",
+                            fontsize=LABEL_SIZE, color="white", pad=3,
+                            fontfamily="monospace"
+                        )
+
+                        # ── Spectral overlay (alpha-blended, not flat mask) ──────
+                        overlay = rgb_gt_np.copy().astype(np.float32) / 255.0
+                        color_f = color.astype(np.float32) / 255.0
+                        overlay[mask]  = (1 - ALPHA) * overlay[mask] + ALPHA * color_f
+                        overlay[~mask] *= 0.25               # dim unselected region
+                        overlay = np.clip(overlay, 0, 1)
+
+                        ax_sp = fig.add_subplot(gs[r + rows, c])
+                        ax_sp.imshow(overlay)
+
+                        # coloured top-edge accent bar
+                        ax_sp.axhline(y=0, color=hex_c, linewidth=3, xmin=0, xmax=1)
+
+                        for spine in ax_sp.spines.values():
+                            spine.set_edgecolor(hex_c)
+                            spine.set_linewidth(BORDER_PX)
+
+                        ax_sp.set_xticks([]); ax_sp.set_yticks([])
+
+                    # ── legend strip ─────────────────────────────────────────────────
+                    ax_leg = fig.add_subplot(gs[-1, :])
+                    ax_leg.set_axis_off()
+                    valid_m = [m for m in range(M) if (seg_np == m).sum() > 0]
+                    for idx, m in enumerate(valid_m):
+                        hex_c = "#{:02X}{:02X}{:02X}".format(*colors[m])
+                        x = idx / max(len(valid_m), 1)
+                        ax_leg.add_patch(plt.Rectangle((x, 0.2), 0.8 / len(valid_m), 0.6,
+                                        color=hex_c, transform=ax_leg.transAxes))
+                        ax_leg.text(x + 0.4 / len(valid_m), 0.5, str(m),
+                                ha="center", va="center", fontsize=7,
+                                color="white", transform=ax_leg.transAxes,
+                                fontfamily="monospace")
+
+                    # ── titles & save ────────────────────────────────────────────────
+                    fig.suptitle(
+                        f"Segmentation  |  {M} segments  |  step {step:04d}  |  img {i:04d}",
+                        color="white", fontsize=9, y=1.002, fontfamily="monospace"
+                    )
+
+                    os.makedirs(f"{cfg.result_dir}/segmentation", exist_ok=True)
+                    fig.savefig(
+                        f"{prefix}_seg_grid.png",
+                        dpi=DPI, bbox_inches="tight",
+                        facecolor=fig.get_facecolor()
+                    )
+                    plt.close(fig)
+
+                    print(f"[seg] saved → {prefix}_seg_grid.png")
+
+                # -------------------------------------------------------------- #
+                # VIRIDIS ENDMEMBER VISUALIZATION
+                # -------------------------------------------------------------- #
+                if cfg.ae_opt and seg_np is not None:
+
+                    os.makedirs(f"{cfg.result_dir}/segmentation", exist_ok=True)
+
+                    prefix = os.path.join(
+                        f"{cfg.result_dir}/segmentation",
+                        f"{stage}_step{step:04d}_{i:04d}"
+                    )
+
+                    # ----------------------------------------------------------
+                    # IMPORTANT:
+                    #
+                    # abundance_maps shape should be:
+                    #
+                    #   [H, W, M]
+                    #
+                    # where:
+                    #   M = number of endmembers / segments
+                    #
+                    # Replace this with YOUR tensor.
+                    # ----------------------------------------------------------
+                    abundance_maps = ab_np
+
+                    H, W, M_maps = abundance_maps.shape
+                    assert M_maps == M, f"Expected {M} maps but got {M_maps}"
+
+                    # ----------------------------------------------------------
+                    # Layout
+                    # ----------------------------------------------------------
+                    cols = min(4, M)
+                    rows = (M + cols - 1) // cols
+
+                    DPI = 160
+                    CELL_SIZE = 3.0
+
+                    fig = plt.figure(
+                        figsize=(cols * CELL_SIZE, rows * CELL_SIZE + 0.4),
+                        dpi=DPI
+                    )
+
+                    fig.patch.set_facecolor("#0a0a0a")
+
+                    gs = fig.add_gridspec(
+                        rows + 1,
+                        cols,
+                        height_ratios=[1] * rows + [0.08],
+                        hspace=0.06,
+                        wspace=0.04,
+                    )
+
+                    # ----------------------------------------------------------
+                    # GLOBAL NORMALIZATION
+                    # Keeps all endmembers comparable
+                    # ----------------------------------------------------------
+                    global_min = abundance_maps.min()
+                    global_max = abundance_maps.max()
+
+                    norm = plt.Normalize(
+                        vmin=float(global_min),
+                        vmax=float(global_max)
+                    )
+
+                    cmap = plt.cm.viridis
+
+                    # ----------------------------------------------------------
+                    # Draw each endmember
+                    # ----------------------------------------------------------
+                    for m in range(M):
+
+                        r, c = divmod(m, cols)
+
+                        ax = fig.add_subplot(gs[r, c])
+
+                        abundance = abundance_maps[..., m]
+
+                        # Optional:
+                        # mask only this segment
+                        mask = (seg_np == m)
+
+                        vis = abundance.copy()
+
+                        # dark background outside segment
+                        vis[~mask] = np.nan
+
+                        im = ax.imshow(
+                            vis,
+                            cmap=cmap,
+                            norm=norm,
+                            interpolation="nearest"
+                        )
+
+                        # background color
+                        ax.set_facecolor("#050505")
+
+                        ax.set_xticks([])
+                        ax.set_yticks([])
+
+                        for spine in ax.spines.values():
+                            spine.set_edgecolor("#333333")
+                            spine.set_linewidth(1.0)
+
+                        pct = 100 * mask.sum() / mask.size
+                        mean_val = abundance[mask].mean()
+
+                        ax.set_title(
+                            f"endmember {m} | {pct:.1f}% | μ={mean_val:.4f}",
+                            fontsize=8,
+                            color="#dddddd",
+                            pad=4,
+                            fontfamily="monospace"
+                        )
+
+                    # ----------------------------------------------------------
+                    # Hide empty cells
+                    # ----------------------------------------------------------
+                    total_cells = rows * cols
+
+                    for k in range(M, total_cells):
+
+                        r, c = divmod(k, cols)
+
+                        ax = fig.add_subplot(gs[r, c])
+                        ax.set_visible(False)
+
+                    # ----------------------------------------------------------
+                    # Shared colorbar
+                    # ----------------------------------------------------------
+                    cax = fig.add_subplot(gs[-1, :])
+
+                    cb = fig.colorbar(
+                        plt.cm.ScalarMappable(norm=norm, cmap=cmap),
+                        cax=cax,
+                        orientation="horizontal"
+                    )
+
+                    cb.ax.tick_params(
+                        labelsize=7,
+                        colors="#bbbbbb"
+                    )
+
+                    cb.outline.set_edgecolor("#444444")
+
+                    cb.set_label(
+                        "endmember abundance",
+                        fontsize=8,
+                        color="#cccccc",
+                        fontfamily="monospace"
+                    )
+
+                    # ----------------------------------------------------------
+                    # Title
+                    # ----------------------------------------------------------
+                    fig.suptitle(
+                        f"Viridis Endmember Maps | M={M} | step={step:04d} | img={i:04d}",
+                        fontsize=10,
+                        color="white",
+                        y=0.995,
+                        fontfamily="monospace"
+                    )
+
+                    save_path = f"{prefix}_viridis_endmembers.png"
+
+                    fig.savefig(
+                        save_path,
+                        dpi=DPI,
+                        bbox_inches="tight",
+                        facecolor=fig.get_facecolor()
+                    )
+
+                    plt.close(fig)
+
+                    print(f"[seg] saved viridis endmember maps → {save_path}")
+
 
             del spectrum_pre, spectrum_gt, rgb_pre, rgb_gt
 
-        # ---------------------------------------------------------------------- #
-        # ENDMEMBER PLOT  (after loop)                                            #
-        # ---------------------------------------------------------------------- #
-        if endmembers_cpu is not None:
-            wavelengths_np = np.linspace(450, 650, cfg.num_spectral_bands)
-            fig, ax = plt.subplots(figsize=(10, 6))
-            for em_idx in range(cfg.num_endmembers):
-                ax.plot(wavelengths_np, endmembers_cpu[em_idx],
-                        linewidth=2, label=f"Endmember {em_idx+1}")
-            ax.set_xlabel("Wavelength (nm)")
-            ax.set_ylabel("Reflectance / Intensity")
-            ax.set_title("Spectral Signatures of Learned Endmembers")
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-            fig.tight_layout()
-            os.makedirs(f"{cfg.result_dir}/endmembers", exist_ok=True)
-            save_path = os.path.join(f"{cfg.result_dir}/endmembers",
-                                    f"{stage}_step{step:04d}_endmembers.png")
-            fig.savefig(save_path, dpi=300, bbox_inches="tight")
-            plt.close(fig)
-            print(f"Saved endmember plot to: {save_path}")
-
+        self.endmember_tracker.save(
+            f"{cfg.result_dir}/endmembers",
+            fps=2,
+        )
         # ---------------------------------------------------------------------- #
         # METRICS JSON                                                             #
         # ---------------------------------------------------------------------- #
