@@ -89,7 +89,7 @@ class Config:
     # Rendering Mode
 
     rendering_mode: Literal["rgb","spectral", "rgb_sh", "spectral_sh", "ae_opt", "ae_opt_sh"] = "rgb"
-
+    unmixing_model: Literal["naive","elmm_sh"] = "naive"
 
     # Port for the viewer server
     #port: int = 8080
@@ -268,7 +268,7 @@ class Config:
     ae_weight:int = 512
     init_mode: str = "random" # random or kmeans
 
-    sam_lambda:float = 0.01
+    sam_lambda:float = 0.1
 
 
 
@@ -327,6 +327,7 @@ def create_splats_with_optimizers(
     ae_height: int = 512,
     ae_width: int = 512,
     init_mode: str = "random",
+    unmixing_model = "naive"
 
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
 
@@ -384,15 +385,20 @@ def create_splats_with_optimizers(
             abundances_init = torch.zeros(N, num_endmembers)
             params.append(("abundances", torch.nn.Parameter(abundances_init), ae_lr))
             if ae_specular:
-                bands = torch.full((N, ((sh_degree + 1) ** 2)-1, num_endmembers),0.5)
-                params.append(("shN", torch.nn.Parameter(rgb_to_sh(bands[:, :, :])), shN_lr))
+                k_coeff = ((sh_degree + 1) ** 2) - 1
+                if unmixing_model == "naive":
+                    sh_N = torch.full((N, k_coeff, num_endmembers),0.5)
+                    params.append(("shN", torch.nn.Parameter(rgb_to_sh(shN), shN_lr)))
+                elif unmixing_model == "elmm_sh":
+                    sh_N = torch.zeros(N, k_coeff, num_endmembers)
+                    params.append(("shN", torch.nn.Parameter(sh_N), shN_lr))
             endmembers = torch.nn.Parameter(
                 torch.rand(num_endmembers, num_spectral_bands)
             )
         else:
-            #print("HYPERSPECTRAL (no SH)")
             spectrum = torch.rand((N, num_spectral_bands))
             params.append(("spectrum", torch.nn.Parameter(spectrum), sh0_lr))
+            endmembers = None
         
 
     else:  # RGB
@@ -583,6 +589,7 @@ class Runner:
             ae_specular=cfg.ae_specular,
             num_endmembers=cfg.num_endmembers,
             ae_lr=cfg.ae_lr,
+            unmixing_model=cfg.unmixing_model
 
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
@@ -771,16 +778,27 @@ class Runner:
             elif self.cfg.ae_opt:
                 # Rasterizer will alpha-composite these into [C, H, W, B]   
                 if cfg.ae_specular:
-                    sh0 = torch.softmax(self.splats["abundances"], dim=-1).unsqueeze(1)  # [N, 1, R] R endmembers
-                    shN = torch.softmax(self.splats["shN"], dim=-1) # [N, K-1, R]
-                    colors = torch.cat([sh0, shN], 1)
-                    sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
+                    if cfg.unmixing_model == "naive":
+                        sh0 = torch.softmax(self.splats["abundances"], dim=-1).unsqueeze(1)  # [N, 1, M] M endmembers
+                        shN = torch.softmax(self.splats["shN"], dim=-1) # [N, K, M]
+                        colors = torch.cat([sh0, shN], 1)
+                        sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
+                        num_bands_render = cfg.num_endmembers
+                    elif cfg.unmixing_model == "elmm_sh":
+                        sh0 = torch.softmax(self.splats["abundances"], dim=-1) # [N, M] M endmembers
+                        shN = self.splats["shN"] # [N, K, M] M bands
+                        #print(f"shN Rasterize shape {shN.shape}")
+                        colors = torch.cat([sh0, shN.view(shN.shape[0], -1)], dim=1) # [N, M + K*M]
+                        #print(f"Colors Rasterize shape {colors.shape}")
+                        sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
+                        num_bands_render = cfg.num_endmembers
+
                 else:
-                    colors = torch.softmax(self.splats["abundances"], dim=-1)  # [N, R] R endmembers
+                    colors = torch.softmax(self.splats["abundances"], dim=-1)  # [N, M] M endmembers
                     sh_degree_for_render = kwargs.pop("sh_degree", None)
                     sh_degree_for_render = None  # no SH on abundance channels
             else:
-                colors = torch.sigmoid(self.splats["spectrum"])  # [.., N, num_bands]
+                colors = torch.sigmoid(self.splats["spectrum"])  # [.., N, B]
                 sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
                 sh_degree_for_render = None  # Disable SH processing
         else:
@@ -821,9 +839,9 @@ class Runner:
             delta_sh = self.wave_module(sh0=self.splats['sh0'],shN=self.splats['shN'],wavelengths=wavelengths)
             #print(f"Shape Colors {colors.shape} and Shape Delth Sh {delta_sh.shape}")
             colors = colors + delta_sh
-            print(f"Antes Sigmoid Color Range in Wave Opt Min:{colors.min()} Max: {colors.max()}")
+            #print(f"Antes Sigmoid Color Range in Wave Opt Min:{colors.min()} Max: {colors.max()}")
             colors = torch.sigmoid(colors)
-            print(f"Despues sigmoid Color Range in Wave Opt Min:{colors.min()} Max: {colors.max()}")
+            #print(f"Despues sigmoid Color Range in Wave Opt Min:{colors.min()} Max: {colors.max()}")
 
         # Rasterization Mode
         # Classic faster,harder edges
@@ -862,7 +880,8 @@ class Runner:
             use_hyperspectral = cfg.use_hyperspectral,
             sh_degree = sh_degree_for_render,
             rendering_mode = self.cfg.rendering_mode,
-            num_bands=cfg.num_endmembers,
+            num_endmembers=cfg.num_endmembers,
+            unmixing_model = cfg.unmixing_model,
             **kwargs,
         )
         # foreground only supervision
@@ -871,9 +890,26 @@ class Runner:
         if masks is not None:
             render_colors[~masks] = 0
         
-        # #print("function rasterize splats")
-        # #print("render", render_colors.shape)
-        # #print("rebnder_alphas", render_alphas.shape)
+
+        if cfg.ae_opt and self.endmembers is not None:
+            E = torch.sigmoid(self.endmembers).to(render_colors.device)  # [M, B]
+
+            if cfg.unmixing_model == "elmm_sh":
+
+                a   = render_colors          # [C, H, W, M]
+                #print(f"Shape a {a.shape}")
+                psi = info["render_psi"]     # [C, H, W, M]  logits offset 0.5
+                psi = torch.sigmoid(psi)     # [C, H, W, M]  (0, 1)
+
+                # y_pixel = Σ_k  a_k · ψ_k(ω) · m_k
+                a_mod = a * psi              # [C, H, W, M]
+                render_colors = torch.einsum("chwm,mb->chwb", a_mod, E)  # [C, H, W, B]
+
+            else:
+                a = render_colors
+                render_colors = torch.einsum("chwm,mb->chwb", a, E)
+
+        render_colors = render_colors.clamp(0.0,1.0)
         return render_colors, render_alphas, info
 
     def train(self):
@@ -1020,9 +1056,7 @@ class Runner:
             if cfg.ae_opt and self.endmembers is not None:
                 # rendered: [C, H, W, B]
                 # E:        [M, B]  
-                E = torch.nn.functional.sigmoid(self.endmembers).to(renders.device)  # [M, B]
-                colors = torch.einsum("chwm,mb->chwb", renders, E).clamp(0.0, 1.0) # [C, H, W, B]
-
+                colors = renders
                 if step % 1000 == 0:
                     self.endmember_tracker.update(
                         self.endmembers,
@@ -1190,7 +1224,7 @@ class Runner:
                 self.writer.flush()
 
             # save checkpoint before updating the model
-            if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
+            if step in [i - 1 for i in cfg.save_steps]:
                 assert world_rank == 0, print(f"tb_every {cfg.tb_every}, step {step} , step%tb_every {step % cfg.tb_every}")
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 stats = {
@@ -1254,22 +1288,6 @@ class Runner:
                             save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
                         )
                 else:
-                    # RGB mode with SH coefficients
-                    # if self.cfg.app_opt:
-                    #     # eval at origin to bake the appearance into the colors
-                    #     rgb = self.app_module(
-                    #         features=self.splats["features"],
-                    #         embed_ids=None,
-                    #         dirs=torch.zeros_like(self.splats["means"][None, :, :]),
-                    #         sh_degree=cfg.sh_degree_to_use,
-                    #     )
-                    #     rgb = rgb + self.splats["colors"]
-                    #     rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
-                    #     sh0 = rgb_to_sh(rgb)
-                    #     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
-                    # else:
-                    #     sh0 = self.splats["sh0"]
-                    #     shN = self.splats["shN"]
 
                     if self.cfg.sh_degree is not None:
                         sh0 = self.splats["sh0"]
@@ -1444,13 +1462,14 @@ class Runner:
             # ------------------------------------------------------------------ #
             tic = time.time()
 
-            abundances, _, _ = self.rasterize_splats(   # [1,H,W,M]  (raw splat output)
+            renders, _, info = self.rasterize_splats(   
                 camtoworlds=camtoworlds, Ks=Ks,
                 width=width, height=height,
                 near_plane=cfg.near_plane, far_plane=cfg.far_plane,
                 masks=masks,
-            )
-
+            )   
+            abundances = info["abudances"]
+          
             # ------------------------------------------------------------------ #
             # SEGMENTATION  (GPU, before einsum — abundances still in [1,H,W,M]) #
             # ------------------------------------------------------------------ #
@@ -1459,7 +1478,8 @@ class Runner:
                 E = torch.sigmoid(self.endmembers).to(device)      # [M, Bands]
 
                 # softmax over endmember dim → proper mixing fractions [1,H,W,M]
-                ab_gpu  = torch.softmax(abundances, dim=-1)
+                #ab_gpu  = torch.softmax(abundances, dim=-1)
+                ab_gpu = abundances
                 seg_gpu = torch.argmax(ab_gpu, dim=-1)             # [1,H,W]  int64
                 conf_gpu = ab_gpu.max(dim=-1).values               # [1,H,W]  float
 
@@ -1471,7 +1491,7 @@ class Runner:
                 M = cfg.num_endmembers
 
                 # reconstruct spectrum on GPU
-                spectrum_pre = torch.einsum("chwm,mb->chwb", abundances, E)
+                spectrum_pre = renders
 
                 print(f"[ae] abundances [{abundances.min():.3f}, {abundances.max():.3f}]  "
                     f"E [{E.min():.3f}, {E.max():.3f}]  "
@@ -1554,7 +1574,7 @@ class Runner:
                 # -------------------------------------------------------------- #
                 # SEGMENTATION outputs (only when ae_opt is active)              #
                 # -------------------------------------------------------------- #
-                if cfg.ae_opt and seg_np is not None:
+                if cfg.ae_opt and seg_np is not None and self.endmembers is not None:
 
                     cols = min(4, M)
                     rows = (M + cols - 1) // cols
@@ -1852,10 +1872,11 @@ class Runner:
 
             del spectrum_pre, spectrum_gt, rgb_pre, rgb_gt
 
-        self.endmember_tracker.save(
-            f"{cfg.result_dir}/endmembers",
-            fps=2,
-        )
+        if self.endmembers is not None:
+            self.endmember_tracker.save(
+                f"{cfg.result_dir}/endmembers",
+                fps=2,
+            )
         # ---------------------------------------------------------------------- #
         # METRICS JSON                                                             #
         # ---------------------------------------------------------------------- #

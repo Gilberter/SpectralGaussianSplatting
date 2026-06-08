@@ -125,6 +125,9 @@ SH_HSI=false
 NUM_SAVES=2
 
 NOISE_LR=500000
+
+UNMIXING_MODEL=naive
+
 ## wandb
 
 USE_WANDB=false # use wandb
@@ -201,6 +204,12 @@ while [[ $# -gt 0 ]]; do
 
         --ckpt)
             CKPT_PATH=$2
+            shift 2
+            ;;
+
+
+        --unmix)
+            UNMIXING_MODEL=$2
             shift 2
             ;;
 
@@ -490,6 +499,8 @@ print_info "Final Save Steps string: $SAVE_STEPS"
     printf "%-30s %s\n" "App Embed Dim:" "$APP_EMBED_DIM"
     printf "%-30s %s\n" "SSIM_LAMBDA:" "$SSIM_LAMBDA"
     printf "%-30s %s\n" "Num Endmembers:" "$NUM_ENDMEMBERS"
+    printf "%-30s %s\n" "Unmixing Mode:" "$UNMIXING_MODEL"
+
 
     [ "$ABSGRAD" = true ]   && printf "%-30s %s\n" "Grow Grad2D:" "$GROW_GRAD2D"
     [ "$BILATERAL" = true ] && printf "%-30s %s\n" "Bilateral Grid Shape:" "($BILATERAL_SHAPE_X, $BILATERAL_SHAPE_Y, $BILATERAL_SHAPE_W)"
@@ -535,8 +546,12 @@ FLAGS="$FLAGS --num_endmembers $NUM_ENDMEMBERS"
 
 FLAGS="$FLAGS --hyperspectral_data_dir $NPY_DIR"
 FLAGS="$FLAGS --rgb_data_dir $RGB_DIR"
+FLAGS="$FLAGS --unmixing_model $UNMIXING_MODEL"
+
+
 
 FLAGS="$FLAGS --rendering_mode $RENDER"
+
 
 
 # Add conditional flags
@@ -595,11 +610,12 @@ if [ "$RENDER" = "ae_opt_sh" ]; then
     FLAGS="$FLAGS --ae_specular"
     FLAGS="$FLAGS --ae_opt"
     FLAGS="$FLAGS --sh_hyperspectral"
-fi
+fi 
 
 if [ "$RENDER" = "ae_opt" ]; then
     FLAGS="$FLAGS --ae_opt"
 fi
+
 
 # [ "$GROUND_LOSS"    -eq 1 ] && FLAGS="$FLAGS --ground_depth_loss --ground_seg_dir $GROUND_DIR "
 
