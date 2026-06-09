@@ -220,19 +220,6 @@ Endmembers  Abundances
 
 By combining ELMM with Hyperspectral 3D Gaussian Splatting, the framework not only reconstructs novel hyperspectral views but also provides a material-level understanding of the scene that remains robust to spectral variability across multiple viewpoints.
 
-
-
-```python
-import numpy as np
-
-# render_colors: Tensor [..., C, H, W, B]
-np.save("outputs/scene_01/render_spectral.npy",
-        render_colors.cpu().numpy().astype("float32"))
-
-np.save("outputs/scene_01/render_alpha.npy",
-        render_alphas.cpu().numpy().astype("float32"))
-```
-
 ---
 
 ## Running the Pipeline
@@ -241,12 +228,10 @@ np.save("outputs/scene_01/render_alpha.npy",
 
 The `rasterization()` function in `rendering.py` supports four rendering modes controlled by the `rendering_mode` argument:
 
-| `rendering_mode` | `use_hyperspectral` | `sh_hyperspectral` | Description |
-|---|---|---|---|
-| `"rgb"` | `False` | `False` | Standard 3-channel RGB rendering, no SH |
-| `"rgb_sh"` | `False` | `False` | RGB rendering with Spherical Harmonics (`sh_degree` ≥ 0) |
-| `"spectral"` | `True` | `False` | Full-spectrum rendering (N bands), post-activation colors |
-| `"spectral_sh"` | `True` | `True` | Full-spectrum rendering with wavelength-aware SH (`sh_degree` ≥ 0) |
+- `"rgb"`Standard 3-channel RGB rendering, no SH
+- `"rgb_sh"` RGB rendering with Spherical Harmonics (`sh_degree` ≥ 0) |
+- `"spectral"`  Full-spectrum rendering (N bands), post-activation colors |
+- `"spectral_sh"` Full-spectrum rendering with wavelength-aware SH (`sh_degree` ≥ 0) |
 
 **Quick-start — spectral rendering with SH on NeSpoF:**
 
@@ -259,7 +244,7 @@ render_colors, render_alphas, meta = rasterization(
     quats=quats,            # [N, 4]
     scales=scales,          # [N, 3]
     opacities=opacities,    # [N]
-    colors=colors,          # [N, K, 21]  — SH coefficients, K=(sh_degree+1)^2
+    colors=colors,          # [N, K, M]  — SH coefficients, K=(sh_degree+1)^2
     viewmats=viewmats,      # [C, 4, 4]
     Ks=Ks,                  # [C, 3, 3]
     width=W,
@@ -277,7 +262,7 @@ render_colors, render_alphas, meta = rasterization(
 
 ---
 
-## Results
+<!-- ## Results
 
 All visual results are saved as `.png` images in `outputs/<scene>/`. Spectral volumes are saved as `.npy` for downstream analysis (unmixing, segmentation, band-specific inspection).
 
@@ -385,7 +370,7 @@ Semantic segmentation of hyperspectral scenes is derived directly from the abund
 
 The `segmented=True` flag in `rasterization()` activates a **segmented radix sort** within the tile-based rasterizer, which processes Gaussians per tile-segment rather than globally. This reduces unnecessary global memory accesses and improves throughput for scenes with spatially concentrated clusters of Gaussians — typical of multi-material hyperspectral scenes.
 
----
+--- -->
 
 ## Citation
 
