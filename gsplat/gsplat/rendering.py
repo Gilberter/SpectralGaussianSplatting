@@ -1,3 +1,5 @@
+
+
 import math
 from typing import Dict, Optional, Tuple
 
@@ -149,7 +151,10 @@ def rasterization(
     sh_hyperspectral: bool = False,
     use_hyperspectral: bool = True,
     num_bands: int = 21 ,# Set for nespof
-    rendering_mode: Literal["rgb","spectral", "rgb_sh", "spectral_sh"] = "rgb"
+    num_endmembers: int = 5,
+    rendering_mode: Literal["rgb","spectral", "rgb_sh", "spectral_sh", "ae_opt", "ae_opt_sh"] = "rgb",
+    unmixing_model: Literal["naive","elmm_sh"] = "naive"
+
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -345,6 +350,7 @@ def rasterization(
         'opacities', 'tile_width', 'tile_height', 'tiles_per_gauss', 'isect_ids',
         'flatten_ids', 'isect_offsets', 'width', 'height', 'tile_size'])
 
+    # rendering.py rasterization function
     """
     meta = {}
 
@@ -374,6 +380,10 @@ def rasterization(
     if use_hyperspectral == True:
         if rendering_mode == "spectral_sh":
             assert sh_hyperspectral == True and sh_degree >= 0, "If you are in Hyperspectral Mode with SH the sh degree must be [0,1,2,3]"
+        
+        elif rendering_mode == "ae_opt_sh":
+            assert sh_degree >= 0, "If you are in AE Optimization"
+        
         else:
             assert sh_degree == None and sh_hyperspectral == False, "Rendering mode spectral without SH sh_degree is None, sh_hyperspectral False"
     # RGB Assert if RGB Mode
@@ -383,6 +393,9 @@ def rasterization(
         else:
             sh_degree = None
             assert sh_degree == None, "Rendering mode RGB without SH"
+
+
+
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
@@ -404,16 +417,20 @@ def rasterization(
             # print("colors.dim()",colors.dim())
             # print("batch_dims + (C, N),",batch_dims + (C, N))
             # print("and colors.shape[-1] > 3 # more than 3 bands rgb", colors.shape[-1] > 3) # more than 3 bands rgb)
-            assert (
-                colors.dim() == num_batch_dims + 3
-                and colors.shape[:-2] == batch_dims + (N,)
-                and colors.shape[-1] > 3 # more than 3 bands rgb
-            ), colors.shape
-            assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
-            if distributed:
+            if unmixing_model == "naive":
                 assert (
                     colors.dim() == num_batch_dims + 3
-                ), "Distributed mode only supports per-Gaussian colors."
+                    and colors.shape[:-2] == batch_dims + (N,)
+                    and colors.shape[-1] > 3 # more than 3 bands rgb
+                ), colors.shape
+                assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
+                if distributed:
+                    assert (
+                        colors.dim() == num_batch_dims + 3
+                    ), "Distributed mode only supports per-Gaussian colors."
+            elif unmixing_model == "elmm_sh":
+                pass
+                #print(f"Unmixing Model ELMM SH Shape {colors.shape} [N,R + K*B]")
             
         else:
             # Not use SH Hyperspectral
@@ -613,21 +630,15 @@ def rasterization(
     else:
         # sh for hyperspectral
         if sh_hyperspectral:
-
-            # Colors are SH coefficients, with shape [..., N, K, bands] or [..., C, N, K, bands]
-            campos = torch.inverse(viewmats)[..., :3, 3]  # [..., C, 3]
-            if viewmats_rs is not None:
-                campos_rs = torch.inverse(viewmats_rs)[..., :3, 3]
-                campos = 0.5 * (campos + campos_rs)  # [..., C, 3]
-            if packed:
-                print("Packed we dont mind")
-            else:
+            if unmixing_model == "naive":
+                # Colors are SH coefficients, with shape [..., N, K, bands] or [..., C, N, K, bands]
+                campos = torch.inverse(viewmats)[..., :3, 3]  # [..., C, 3]
                 dirs = means[..., None, :, :] - campos[..., None, :]  # [..., C, N, 3]
                 masks = (radii > 0).all(dim=-1)  # [..., C, N]
                 if colors.dim() == num_batch_dims + 3:
                     # Turn [..., N, K, 3] into [..., C, N, K, bands]
                     shs = torch.broadcast_to(
-                        colors[..., None, :, :, :], batch_dims + (C, N, -1, num_bands)
+                        colors[..., None, :, :, :], batch_dims + (C, N, -1, num_endmembers)
                     )
                 else:
                     # colors is already [..., C, N, K, bands]
@@ -635,9 +646,42 @@ def rasterization(
                 colors = _spherical_harmonics_hs(
                     sh_degree, dirs, shs, masks=masks
                 )  # [..., C, N, bands]
-            # make it apple-to-apple with Inria's CUDA Backend.
-            colors = torch.clamp_min(colors + 0.5, 0.0)
-        
+                # make it apple-to-apple with Inria's CUDA Backend.
+                colors = torch.clamp_min(colors + 0.5, 0.0)
+            elif unmixing_model == "elmm_sh":
+                
+                M = num_endmembers
+                K = (sh_degree + 1) ** 2
+                # Evaluate shN view-dependent residual
+                campos = torch.inverse(viewmats)[..., :3, 3]  # [..., C, 3]
+                dirs = means[..., None, :, :] - campos[..., None, :]  # [..., C, N, 3]
+                masks = (radii > 0).all(dim=-1)  # [..., C, N]
+                
+                # Split packed colors
+                abundances = colors[..., :M]        # [..., N, M]
+                shN_flat   = colors[..., M:]        # [..., N, K*M]
+                print(f"Abudances in rendering.py {abundances.shape}")
+                print(f"shN_flat in rendering.py {shN_flat.shape}")
+                shN_sh = shN_flat.view(*abundances.shape[:-1], -1, M)  # [N, 15, M]
+                sh0_sh = abundances.unsqueeze(-2)     # [N, 1, M]
+                shs_psi = torch.cat([sh0_sh, shN_sh], dim=-2)  # [N, K, M]              
+    
+
+                # Evaluate SH residual per direction
+                psi_view  = _spherical_harmonics_hs(
+                    sh_degree, dirs, shs_psi, masks=masks
+                )  # [..., C, N, M]
+                
+                psi_view = psi_view + 0.5  # logits for sigmoid in rasterize_splats()
+
+                # Broadcast abundances over cameras
+                abundances_bc  = torch.broadcast_to(
+                    abundances[..., None, :, :], batch_dims + (C, N, M)
+                )  # [..., C, N, M]
+                
+                # Pack back together for single rasterization pass
+                colors = torch.cat([abundances_bc, psi_view], dim=-1)  # [..., C, N, 2M]
+
         # sh for RGB
         else:
             # Colors are SH coefficients, with shape [..., N, K, 3] or [..., C, N, K, 3]
@@ -805,6 +849,20 @@ def rasterization(
                 packed=packed,
                 absgrad=absgrad,
             )
+            
+    
+    if unmixing_model == "elmm_sh":
+        # render_colors es [..., C, H, W, 2M]
+        M = num_endmembers
+        render_abundances = render_colors[..., :M]   # [..., C, H, W, M]
+        render_psi        = render_colors[..., M:]   # [..., C, H, W, M] logits with +0.5
+
+        meta["render_psi"]  = render_psi
+        meta["abundances"]   = render_abundances    
+        render_colors = render_abundances            
+    elif unmixing_model == "naive":
+        meta["abundances"] = render_colors
+    
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(

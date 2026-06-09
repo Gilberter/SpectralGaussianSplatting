@@ -595,10 +595,10 @@ class Runner:
         print("Model initialized. Number of GS:", len(self.splats["means"]))
         if cfg.ae_opt:
             if cfg.ae_specular:
-                print(f"Model Using SH Abudances and Endmembers Optimization")
+                print(f"Model Using SH abundances and Endmembers Optimization")
             else:
                 assert not cfg.sh_hyperspectral, "Cannot run abundances/endmembers optimization with SH hyperspectral enabled!"
-                print(f"Model using Abudances and Endmembers Optimization")
+                print(f"Model using abundances and Endmembers Optimization")
 
 
         # Densification Strategy
@@ -1145,6 +1145,14 @@ class Runner:
                 loss = loss + sam_lambda * samloss
             # OPTIONAL DEPTH LOSS
 
+            # PSI LOSS and Abudances LOSS
+            if cfg.ae_opt and cfg.unmixing_model == "elmm_sh":
+         
+                if self.endmembers is not None and self.endmembers.shape[1] > 1:
+                    E_sig = torch.sigmoid(self.endmembers)
+                    endmember_smooth = ((E_sig[:, 1:] - E_sig[:, :-1]) ** 2).mean()
+                    loss = loss + 1e-3 * endmember_smooth
+
 
             if cfg.depth_loss:
                 # query depths from depth map
@@ -1180,15 +1188,6 @@ class Runner:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
             loss.backward() # backward pass
-
-
-            # torch.nn.utils.clip_grad_norm_(
-            #     list(self.splats.parameters()), max_norm=1.0
-            # )
-            # if self.endmembers is not None:
-            #     torch.nn.utils.clip_grad_norm_(
-            #         [self.endmembers], max_norm=1.0
-            #     )
 
             desc = f"loss={loss.item():.3f}| ssim= {ssimloss} l1loss = {l1loss} "
             if cfg.depth_loss:
@@ -1468,7 +1467,7 @@ class Runner:
                 near_plane=cfg.near_plane, far_plane=cfg.far_plane,
                 masks=masks,
             )   
-            abundances = info["abudances"]
+            abundances = info["abundances"]
           
             # ------------------------------------------------------------------ #
             # SEGMENTATION  (GPU, before einsum — abundances still in [1,H,W,M]) #
@@ -1538,6 +1537,14 @@ class Runner:
                 metric_ssim.append((i, self.ssim(spectrum_gt, spectrum_pre).item()))
                 metric_lpips.append((i, self.lpips(rgb_gt, rgb_pre).item()))
 
+                test_psnr  = self.psnr(spectrum_gt, spectrum_gt)
+                test_ssim  = self.ssim(spectrum_gt, spectrum_gt)
+                test_lpips = self.lpips(rgb_gt, rgb_gt)
+
+                print("Identity PSNR :", test_psnr.item())
+                print("Identity SSIM :", test_ssim.item())
+                print("Identity LPIPS:", test_lpips.item())
+                
                 # pull to CPU once
                 spectrum_pre_cpu = spectrum_pre.cpu()
                 spectrum_gt_cpu  = spectrum_gt.cpu()
