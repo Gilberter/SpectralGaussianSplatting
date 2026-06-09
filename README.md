@@ -275,7 +275,7 @@ All visual results are saved as `.png` images in `outputs/<scene>/`. Spectral vo
 | Scene 01 | ![](assets/results/scene01_gt.png) | ![](assets/results/scene01_render.png) | ![](assets/results/scene01_diff.png) |
 | Scene 02 | ![](assets/results/scene02_gt.png) | ![](assets/results/scene02_render.png) | ![](assets/results/scene02_diff.png) |
 -->
-
+<!-- 
 ```
 [ Placeholder — add rendered .png comparisons (GT / Ours / Difference map) ]
 ```
@@ -289,7 +289,7 @@ All visual results are saved as `.png` images in `outputs/<scene>/`. Spectral vo
 
 > Fill in your numbers after training.
 
-**Band-specific renders** (example: band 5 / band 12 / band 20):
+**Band-specific renders** (example: band 5 / band 12 / band 20): -->
 
 <!-- ADD BAND-SPECIFIC .png IMAGES HERE -->
 <!-- Example:
@@ -298,15 +298,15 @@ All visual results are saved as `.png` images in `outputs/<scene>/`. Spectral vo
 | ![](assets/results/scene01_band05.png) | ![](assets/results/scene01_band12.png) | ![](assets/results/scene01_band20.png) |
 -->
 
-```
+<!-- ```
 [ Placeholder — add per-band rendered .png images ]
-```
+``` -->
 
----
+<!-- ---
 
 ### Abundances
 
-Abundance maps encode the fractional contribution of each endmember at every pixel. They are estimated via the **GLMM** unmixing head after rendering and saved as `.npy` (float32, `[H × W × R]`) and visualised as false-color `.png` images.
+Abundance maps encode the fractional contribution of each endmember at every pixel. They are estimated via the **GLMM** unmixing head after rendering and saved as `.npy` (float32, `[H × W × R]`) and visualised as false-color `.png` images. -->
 
 <!-- ADD YOUR ABUNDANCE MAP .png RESULTS HERE -->
 <!-- Example:
@@ -315,11 +315,11 @@ Abundance maps encode the fractional contribution of each endmember at every pix
 | Scene 01 | ![](assets/results/scene01_abund_e1.png) | ![](assets/results/scene01_abund_e2.png) | ![](assets/results/scene01_abund_e3.png) |
 -->
 
-```
+<!-- ```
 [ Placeholder — add per-endmember abundance map .png images ]
-```
+``` -->
 
-Each abundance image is a single-channel heatmap where brighter pixels indicate a higher fractional presence of the corresponding material. The maps sum to one across the endmember axis for every pixel.
+<!-- Each abundance image is a single-channel heatmap where brighter pixels indicate a higher fractional presence of the corresponding material. The maps sum to one across the endmember axis for every pixel.
 
 **Quantitative unmixing metrics (NeSpoF):**
 
@@ -335,7 +335,7 @@ Each abundance image is a single-channel heatmap where brighter pixels indicate 
 
 ### Endmembers
 
-Endmembers are the spectral signatures of the R pure materials present in the scene. They are jointly estimated with the abundances during unmixing and stored as `.npy` (float32, `[R × 21]`). Below, each endmember spectrum is plotted as reflectance vs. band index.
+Endmembers are the spectral signatures of the R pure materials present in the scene. They are jointly estimated with the abundances during unmixing and stored as `.npy` (float32, `[R × 21]`). Below, each endmember spectrum is plotted as reflectance vs. band index. -->
 
 <!-- ADD YOUR ENDMEMBER SPECTRA .png PLOTS HERE -->
 <!-- Example:
@@ -343,18 +343,18 @@ Endmembers are the spectral signatures of the R pure materials present in the sc
 |---|---|
 | ![](assets/results/endmembers_estimated.png) | ![](assets/results/endmembers_gt.png) |
 -->
-
+<!-- 
 ```
 [ Placeholder — add endmember spectra plots (.png) — estimated vs. ground truth ]
 ```
 
 The GLMM variability tensor Ψ (band-dependent scaling, shape `L × R × N_pixels`) allows each endmember's spectrum to vary across the image plane, capturing illumination gradients and wavelength-specific distortions that a fixed-endmember LMM would miss.
 
----
-
+--- -->
+<!-- 
 ### Segmentation
 
-Semantic segmentation of hyperspectral scenes is derived directly from the abundance volume: the hard material label at each pixel is the argmax over the R endmember abundance channels. This provides a dense, annotation-free segmentation map that is geometrically consistent with the 3D Gaussian representation.
+Semantic segmentation of hyperspectral scenes is derived directly from the abundance volume: the hard material label at each pixel is the argmax over the R endmember abundance channels. This provides a dense, annotation-free segmentation map that is geometrically consistent with the 3D Gaussian representation. -->
 
 <!-- ADD YOUR SEGMENTATION .png RESULTS HERE -->
 <!-- Example:
@@ -364,12 +364,12 @@ Semantic segmentation of hyperspectral scenes is derived directly from the abund
 | Scene 02 | ![](assets/results/scene02_seg_pred.png) | ![](assets/results/scene02_seg_gt.png) |
 -->
 
-```
+<!-- ```
 [ Placeholder — add segmentation mask .png images (predicted vs. ground truth) ]
-```
-
+``` -->
+<!-- 
 The `segmented=True` flag in `rasterization()` activates a **segmented radix sort** within the tile-based rasterizer, which processes Gaussians per tile-segment rather than globally. This reduces unnecessary global memory accesses and improves throughput for scenes with spatially concentrated clusters of Gaussians — typical of multi-material hyperspectral scenes.
-
+ -->
 --- -->
 
 ## Citation
