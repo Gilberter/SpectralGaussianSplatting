@@ -270,6 +270,10 @@ class Config:
 
     sam_lambda:float = 0.1
 
+    spectral_smooth_reg: float = 1e-3
+    diversity_reg: float = 5e-3
+    abundance_reg: float = 1e-2
+    psi_reg: float = 1e-2
 
 
     def adjust_steps(self, factor: float):
@@ -895,15 +899,19 @@ class Runner:
             E = torch.sigmoid(self.endmembers).to(render_colors.device)  # [M, B]
 
             if cfg.unmixing_model == "elmm_sh":
-
-                a   = render_colors          # [C, H, W, M]
+                M = cfg.num_endmembers
+                
+                a_raw   = render_colors          # [C, H, W, M]
                 #print(f"Shape a {a.shape}")
-                psi = info["render_psi"]     # [C, H, W, M]  logits offset 0.5
-                psi = torch.sigmoid(psi)     # [C, H, W, M]  (0, 1)
+                psi_raw = info["render_psi"]     # [C, H, W, M]  logits offset 0.5
 
+                a_pos = torch.relu(a_raw)
+                a_norm = a_pos / a_pos.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+                psi = psi_raw.clamp(min=1e-3)                
                 # y_pixel = Σ_k  a_k · ψ_k(ω) · m_k
-                a_mod = a * psi              # [C, H, W, M]
-                render_colors = torch.einsum("chwm,mb->chwb", a_mod, E)  # [C, H, W, B]
+                a_psi        = a_norm * psi    # [C, H, W, M]
+                render_colors = torch.einsum("chwm,mb->chwb", a_psi, E)  # [C, H, W, B]
 
             else:
                 a = render_colors
@@ -1149,9 +1157,21 @@ class Runner:
             if cfg.ae_opt and cfg.unmixing_model == "elmm_sh":
          
                 if self.endmembers is not None and self.endmembers.shape[1] > 1:
-                    E_sig = torch.sigmoid(self.endmembers)
-                    endmember_smooth = ((E_sig[:, 1:] - E_sig[:, :-1]) ** 2).mean()
-                    loss = loss + 1e-3 * endmember_smooth
+
+                    # Spectral Smoothness
+                    E_spec = torch.sigmoid(self.endmembers)
+                    endmember_smooth = ((E_spec[:, 1:] - E_spec[:, :-1]) ** 2).mean()
+                    loss = loss + cfg.spectral_smooth_reg * endmember_smooth
+
+                    # Endmember Diversity
+                    E_norm = F.normalize(E_spec, dim=-1)
+                    cos_sim = E_norm @ E_norm.T # [M,M]
+                    I = torch.eye(cfg.num_endmembers, device=E_spec.device)
+                    loss = loss + cfg.diversity_reg * ((cos_sim - I)**2).mean()
+
+                    # Psi Regularization
+                    psi_raw = info["render_psi"]
+                    loss = loss + cfg.psi_reg * torch.mean((psi_raw - 1)**2)
 
 
             if cfg.depth_loss:
@@ -1180,9 +1200,12 @@ class Runner:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
 
+            step_ratio = step / max_steps
+            opacity_reg_weight = cfg.opacity_reg * min(1.0, max(0.0, (step_ratio - 0.1) / 0.5))
+
             # regularizations
             if cfg.opacity_reg > 0.0: #prevents too many opaque splats
-                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
+                loss += opacity_reg_weight * torch.sigmoid(self.splats["opacities"]).mean()
             
             if cfg.scale_reg > 0.0: # prevents exploding Gaussians
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
@@ -1360,6 +1383,15 @@ class Runner:
                 self.endmembers_optimizer.step()
                 self.endmembers_optimizer.zero_grad(set_to_none=True)
 
+            noise_end = int(cfg.max_steps * 0.85)   # step 34k
+            if step < noise_end:
+                noise_decay = (1.0 - step / noise_end) ** 2   # quadratic to zero
+            else:
+                noise_decay = 0.0                              # full stop
+
+            adjusted_noise_lr = cfg.noise_lr * noise_decay
+
+
             # Run post-backward steps after backward and optimizer
             # Adaptive part of Gaussian Splatting
             if isinstance(self.cfg.strategy, DefaultStrategy):
@@ -1378,7 +1410,7 @@ class Runner:
                     state=self.strategy_state,
                     step=step,
                     info=info,
-                    lr=schedulers[0].get_last_lr()[0],
+                    lr=adjusted_noise_lr,
                 )
             else:
                 assert_never(self.cfg.strategy)
@@ -1419,7 +1451,7 @@ class Runner:
         )
 
         ellipse_time = 0
-        metric_psnr, metric_ssim, metric_lpips = [], [], []
+        metric_psnr, metric_ssim, metric_lpips, metric_sam = [], [], [], []
         endmembers_cpu = None                          # populated on first ae_opt pass
 
         PALETTE = np.array([
@@ -1449,6 +1481,7 @@ class Runner:
             Ks          = data["K"].to(device)
             spectrum_gt = data["image"].to(device)          # [1,H,W,Bands]
             masks       = data["mask"].to(device) if "mask" in data else None
+            image_name = data["image_name"]
             height, width = spectrum_gt.shape[1:3]
 
             assert spectrum_gt.ndim == 4,                          f"spectrum_gt must be [B,H,W,C], got {spectrum_gt.shape}"
@@ -1536,14 +1569,7 @@ class Runner:
                 metric_psnr.append((i, self.psnr(spectrum_gt, spectrum_pre).item()))
                 metric_ssim.append((i, self.ssim(spectrum_gt, spectrum_pre).item()))
                 metric_lpips.append((i, self.lpips(rgb_gt, rgb_pre).item()))
-
-                test_psnr  = self.psnr(spectrum_gt, spectrum_gt)
-                test_ssim  = self.ssim(spectrum_gt, spectrum_gt)
-                test_lpips = self.lpips(rgb_gt, rgb_gt)
-
-                print("Identity PSNR :", test_psnr.item())
-                print("Identity SSIM :", test_ssim.item())
-                print("Identity LPIPS:", test_lpips.item())
+                metric_sam.append((i, self.sam(spectrum_gt,spectrum_pre).item()))
                 
                 # pull to CPU once
                 spectrum_pre_cpu = spectrum_pre.cpu()
@@ -1579,127 +1605,93 @@ class Runner:
                     np.concatenate(band_rows, axis=0),
                 )
                 # -------------------------------------------------------------- #
-                # SEGMENTATION outputs (only when ae_opt is active)              #
+                # SEGMENTATION VISUALIZATION
                 # -------------------------------------------------------------- #
                 if cfg.ae_opt and seg_np is not None and self.endmembers is not None:
 
-                    cols = min(4, M)
-                    rows = (M + cols - 1) // cols
                     prefix = os.path.join(
                         f"{cfg.result_dir}/segmentation",
                         f"{stage}_step{step:04d}_{i:04d}"
                     )
-                    # ── helpers ──────────────────────────────────────────────────────
-                    CMAP       = plt.cm.nipy_spectral          # swap to tab20, hsv, etc.
-                    ALPHA      = 0.55                           # spectral overlay opacity
-                    BORDER_PX  = 2                              # white cell border (px)
-                    LABEL_SIZE = max(6, min(10, 90 // cols))    # auto-scale font
-                    DPI        = 150
 
-                    # ── per-segment colours ──────────────────────────────────────────
-                    colors = [
-                        (np.array(CMAP(m / max(M - 1, 1))[:3]) * 255).astype(np.uint8)
-                        for m in range(M)
-                    ]
-
-                    # ── figure layout: two rows of grids (RGB top, spectral bottom)
-                    #    + one legend row at the bottom ───────────────────────────────
-                    fig = plt.figure(
-                        figsize=(cols * 2.2, rows * 2.2 * 2 + 0.9),
-                        dpi=DPI, constrained_layout=False
-                    )
-                    fig.patch.set_facecolor("#0d0d0d")
-
-                    gs = fig.add_gridspec(
-                        nrows=rows * 2 + 1,
-                        ncols=cols,
-                        hspace=0.08, wspace=0.04,
-                        height_ratios=[1] * (rows * 2) + [0.18],
+                    os.makedirs(
+                        f"{cfg.result_dir}/segmentation",
+                        exist_ok=True
                     )
 
-                    for m in range(M):
-                        mask = (seg_np == m)
-                        pixel_count = mask.sum()
-                        r, c = divmod(m, cols)
+                    # ----------------------------------------------------------
+                    # Create figure
+                    # ----------------------------------------------------------
+                    fig, ax = plt.subplots(
+                        1, 2,
+                        figsize=(12, 6),
+                        dpi=200
+                    )
 
-                        # ── skip truly empty segments ─────────────────────────────
-                        if pixel_count == 0:
-                            for row_offset in (0, rows):
-                                ax = fig.add_subplot(gs[r + row_offset, c])
-                                ax.set_visible(False)
-                            continue
+                    # ----------------------------------------------------------
+                    # Left: RGB image
+                    # ----------------------------------------------------------
+                    ax[0].imshow(rgb_gt_np)
+                    ax[0].set_title(
+                        "RGB Image",
+                        fontsize=12,
+                        fontweight="bold"
+                    )
+                    ax[0].axis("off")
 
-                        pct   = 100 * pixel_count / seg_np.size
-                        color = colors[m]
-                        hex_c = "#{:02X}{:02X}{:02X}".format(*color)
+                    # ----------------------------------------------------------
+                    # Right: Segmentation map
+                    # ----------------------------------------------------------
+                    seg_vis = ax[1].imshow(
+                        seg_np,
+                        cmap="tab20"
+                    )
 
-                        # ── RGB masked ───────────────────────────────────────────
-                        masked = rgb_gt_np.copy()
-                        masked[~mask] = 0
-                        ax_rgb = fig.add_subplot(gs[r, c])
-                        ax_rgb.imshow(masked)
+                    ax[1].set_title(
+                        f"Segmentation ({M} segments)",
+                        fontsize=12,
+                        fontweight="bold"
+                    )
+                    ax[1].axis("off")
 
-                        # white border around each cell
-                        for spine in ax_rgb.spines.values():
-                            spine.set_edgecolor("white")
-                            spine.set_linewidth(BORDER_PX / 2)
+                    # ----------------------------------------------------------
+                    # Colorbar
+                    # ----------------------------------------------------------
+                    cbar = fig.colorbar(
+                        seg_vis,
+                        ax=ax[1],
+                        fraction=0.046,
+                        pad=0.04
+                    )
 
-                        ax_rgb.set_xticks([]); ax_rgb.set_yticks([])
-                        ax_rgb.set_title(
-                            f"seg {m}  •  {pct:.1f}%",
-                            fontsize=LABEL_SIZE, color="white", pad=3,
-                            fontfamily="monospace"
-                        )
+                    cbar.set_label(
+                        "Segment ID",
+                        rotation=270,
+                        labelpad=15
+                    )
 
-                        # ── Spectral overlay (alpha-blended, not flat mask) ──────
-                        overlay = rgb_gt_np.copy().astype(np.float32) / 255.0
-                        color_f = color.astype(np.float32) / 255.0
-                        overlay[mask]  = (1 - ALPHA) * overlay[mask] + ALPHA * color_f
-                        overlay[~mask] *= 0.25               # dim unselected region
-                        overlay = np.clip(overlay, 0, 1)
-
-                        ax_sp = fig.add_subplot(gs[r + rows, c])
-                        ax_sp.imshow(overlay)
-
-                        # coloured top-edge accent bar
-                        ax_sp.axhline(y=0, color=hex_c, linewidth=3, xmin=0, xmax=1)
-
-                        for spine in ax_sp.spines.values():
-                            spine.set_edgecolor(hex_c)
-                            spine.set_linewidth(BORDER_PX)
-
-                        ax_sp.set_xticks([]); ax_sp.set_yticks([])
-
-                    # ── legend strip ─────────────────────────────────────────────────
-                    ax_leg = fig.add_subplot(gs[-1, :])
-                    ax_leg.set_axis_off()
-                    valid_m = [m for m in range(M) if (seg_np == m).sum() > 0]
-                    for idx, m in enumerate(valid_m):
-                        hex_c = "#{:02X}{:02X}{:02X}".format(*colors[m])
-                        x = idx / max(len(valid_m), 1)
-                        ax_leg.add_patch(plt.Rectangle((x, 0.2), 0.8 / len(valid_m), 0.6,
-                                        color=hex_c, transform=ax_leg.transAxes))
-                        ax_leg.text(x + 0.4 / len(valid_m), 0.5, str(m),
-                                ha="center", va="center", fontsize=7,
-                                color="white", transform=ax_leg.transAxes,
-                                fontfamily="monospace")
-
-                    # ── titles & save ────────────────────────────────────────────────
+                    # ----------------------------------------------------------
+                    # Global title
+                    # ----------------------------------------------------------
                     fig.suptitle(
-                        f"Segmentation  |  {M} segments  |  step {step:04d}  |  img {i:04d}",
-                        color="white", fontsize=9, y=1.002, fontfamily="monospace"
+                        f"{stage.upper()} | Step {step:04d} | Image {i:04d}",
+                        fontsize=14,
+                        fontweight="bold"
                     )
 
-                    os.makedirs(f"{cfg.result_dir}/segmentation", exist_ok=True)
-                    fig.savefig(
-                        f"{prefix}_seg_grid.png",
-                        dpi=DPI, bbox_inches="tight",
-                        facecolor=fig.get_facecolor()
+                    plt.tight_layout()
+
+                    save_path = f"{prefix}_segmentation.png"
+
+                    plt.savefig(
+                        save_path,
+                        dpi=200,
+                        bbox_inches="tight"
                     )
-                    plt.close(fig)
 
-                    print(f"[seg] saved → {prefix}_seg_grid.png")
+                    plt.close()
 
+                    print(f"[seg] saved -> {save_path}")
                 # -------------------------------------------------------------- #
                 # VIRIDIS ENDMEMBER VISUALIZATION
                 # -------------------------------------------------------------- #
@@ -1890,13 +1882,15 @@ class Runner:
         psnr_values  = [v for _, v in metric_psnr]
         ssim_values  = [v for _, v in metric_ssim]
         lpips_values = [v for _, v in metric_lpips]
+        sam_values = [v for _, v in metric_sam]
 
         metrics_dict = {
             "psnr_mean":  float(np.mean(psnr_values)),  "psnr_std":  float(np.std(psnr_values)),
             "ssim_mean":  float(np.mean(ssim_values)),  "ssim_std":  float(np.std(ssim_values)),
             "lpips_mean": float(np.mean(lpips_values)), "lpips_std": float(np.std(lpips_values)),
+            "sam_mean": float(np.mean(sam_values)),
             "num_samples": len(metric_psnr),
-            "per_image": {"psnr": metric_psnr, "ssim": metric_ssim, "lpips": metric_lpips},
+            "per_image": {"psnr": metric_psnr, "ssim": metric_ssim, "lpips": metric_lpips, "image_name": image_name},
             "ellipse_time_seconds": float(ellipse_time),
         }
 

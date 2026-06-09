@@ -870,10 +870,10 @@ class HyperspectralDataset:
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
         image_name = self.parser.image_names[index]
-        print("NPY PATH IMAGE NAME ",image_name)
+        #print("NPY PATH IMAGE NAME ",image_name)
         # Load hyperspectral data from .npy file
         npy_path = self._get_npy_path(image_name)
-        print("NPY PATH ",npy_path)
+        #print("NPY PATH ",npy_path)
         if not npy_path:
             raise FileNotFoundError(
                 f"Cannot find .npy file for image: {image_name}"
@@ -946,6 +946,7 @@ class HyperspectralDataset:
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),  # [H, W, BANDS]
             "image_id": item,
+            "image_name": image_name,
             "num_bands": image.shape[2],
         }
         if mask is not None:

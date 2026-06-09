@@ -392,7 +392,7 @@ FEATURE_NAME=$(IFS=_; echo "${FEATURES[*]}")
 
 # Generate configuration suffix based on non-default parameters
 CONFIG_SUFFIX=""
-if [ "$MAX_STEPS" != "40000" ]; then
+if [ "$MAX_STEPS" != "1" ]; then
     CONFIG_SUFFIX="${CONFIG_SUFFIX}_s${MAX_STEPS}"
 fi
 
