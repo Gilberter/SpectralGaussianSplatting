@@ -1235,14 +1235,14 @@ class Runner:
 
                     if dead_mask.any():
 
-                        E_spec = torch.sigmoid(self.endmembers)
-                        E_norm = F.normalize(E_spec, dim=-1)
+                        E_spec = torch.sigmoid(self.endmembers).to(device)
+                        E_norm = F.normalize(E_spec, dim=-1).to(device)
 
-                        alive_mask = ~dead_mask
+                        alive_mask = ~dead_mask.to(device)
 
                         if alive_mask.any():
 
-                            alive_center = E_norm[alive_mask].mean(dim=0)
+                            alive_center = E_norm[alive_mask.to(device)].mean(dim=0).to(device)
 
                             dead_loss = (
                                 (E_norm[dead_mask] - alive_center)
