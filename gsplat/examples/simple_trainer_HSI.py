@@ -274,7 +274,7 @@ class Config:
     diversity_reg: float = 1e-3
     abundance_reg: float = 1e-2
     psi_reg: float = 1e-2
-    dead_em_reg: float = 1e-3
+    dead_em_reg: float = 1e-5
 
     temperature_start:float = 3.0
     temperature_end:float = 0.5
@@ -947,7 +947,6 @@ class Runner:
                 
                 a_norm = F.softmax(render_colors / self.temperature,dim=-1)          # [C, H, W, M]
             
-                psi_norm = psi 
                 # y_pixel = Σ_k  a_k · ψ_k(ω) · m_k
                 a_psi        = a_norm *  psi   # [C, H, W, M]
                 render_colors = torch.einsum("chwm,mb->chwb", a_psi, E)  # [C, H, W, B]
@@ -1218,10 +1217,10 @@ class Runner:
                     loss += psi_reg_weight * psi_loss
 
                     #Endmember Diversity
-                    E_norm = F.normalize(E_spec, dim=-1)
-                    cos_sim = E_norm @ E_norm.T # [M,M]
-                    I = torch.eye(cfg.num_endmembers, device=E_spec.device)
-                    loss = loss + cfg.diversity_reg * ((cos_sim - I)**2).mean()
+                    # E_norm = F.normalize(E_spec, dim=-1)
+                    # cos_sim = E_norm @ E_norm.T # [M,M]
+                    # I = torch.eye(cfg.num_endmembers, device=E_spec.device)
+                    # loss = loss + cfg.diversity_reg * ((cos_sim - I)**2).mean()
 
                     # NEW: Track endmember usage and apply targeted fixes
                     a_pos = torch.softmax(info["abundances"] / self.temperature, dim=-1)  # [C, H, W, M]
@@ -1238,11 +1237,11 @@ class Runner:
                         E_spec = torch.sigmoid(self.endmembers).to(device)
                         E_norm = F.normalize(E_spec, dim=-1).to(device)
 
-                        alive_mask = ~dead_mask.to(device)
+                        alive_mask = ~dead_mask
 
                         if alive_mask.any():
 
-                            alive_center = E_norm[alive_mask.to(device)].mean(dim=0).to(device)
+                            alive_center = E_norm[alive_mask].mean(dim=0)
 
                             dead_loss = (
                                 (E_norm[dead_mask] - alive_center)
@@ -1258,7 +1257,7 @@ class Runner:
                                 )
                             )
 
-                            loss += resurrection_weight * dead_loss
+                            loss -= resurrection_weight * dead_loss
 
                     # --- CORPUS DIVERSITY (persistent version) ---
                     # Don't decay corpus weight to zero — keeps endmembers diverse throughout training

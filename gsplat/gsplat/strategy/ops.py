@@ -27,23 +27,13 @@ def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Te
         Tensor: A 1D tensor of sampled indices.
     """
     num_elements = weights.size(0)
-    if num_elements == 0 or n == 0:
-        return torch.empty((0,), dtype=torch.long, device=weights.device)
-
-    if torch.any(torch.isnan(weights)) or torch.any(weights < 0):
-        weights = torch.where(torch.isnan(weights) | (weights < 0), 0.0, weights)
-
-    total_weight = weights.sum()
-    if total_weight <= 0.0:
-        weights = torch.full_like(weights, 1.0 / num_elements)
-    else:
-        weights = weights / total_weight
 
     if num_elements <= 2**24:
         # Use torch.multinomial for elements within the limit
         return torch.multinomial(weights, n, replacement=replacement)
     else:
         # Fallback to numpy.random.choice for larger element spaces
+        weights = weights / weights.sum()
         weights_np = weights.detach().cpu().numpy()
         sampled_idxs_np = np.random.choice(
             num_elements, size=n, p=weights_np, replace=replacement
@@ -274,15 +264,10 @@ def relocate(
     alive_indices = (~mask).nonzero(as_tuple=True)[0]
     n = len(dead_indices)
 
-    if n == 0 or alive_indices.numel() == 0:
-        return
-
     # Sample for new GSs
     eps = torch.finfo(torch.float32).eps
     probs = opacities[alive_indices].flatten()  # ensure its shape is [N,]
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
-    if sampled_idxs.numel() == 0:
-        return
     sampled_idxs = alive_indices[sampled_idxs]
     new_opacities, new_scales = compute_relocation(
         opacities=opacities[sampled_idxs],
