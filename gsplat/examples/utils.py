@@ -22,7 +22,57 @@ def _apply_colormap(x: np.ndarray, cmap: str = "magma") -> np.ndarray:
     rgb  = (rgba[:, :, :3] * 255).astype(np.uint8)
     return rgb
 
+import torch
+
+def print_test_validation(tensor_a: torch.Tensor, description: str, tensor_b: torch.Tensor = None):
+    """Validates PyTorch tensor attributes, abundance constraints, and normalization effects concisely."""
+    print(f"--- Tensor Validation: {description} ---")
     
+    # 1. Validate Tensor A
+    stats_a = f"Shape: {list(tensor_a.shape)} | Min: {tensor_a.min().item():.4f} | Max: {tensor_a.max().item():.4f} | Mean: {tensor_a.mean().item():.4f} | Std: {tensor_a.std().item():.4f}"
+    print(f"[Tensor A] {stats_a}")
+    
+    # Abundance Check for Tensor A (Sum along dim=-1 equals 1)
+    sum_a = tensor_a.sum(dim=-1)
+    stats_abundances = f"Min: {sum_a.min().item():.4f} | Max: {sum_a.max().item():.4f} | Mean: {sum_a.mean().item():.4f} | Std: {sum_a.std().item():.4f}"
+    print(f"[Tensor Abundances] {stats_abundances}")
+
+    count_over_09 = (sum_a > 0.9).sum().item()
+    total_pixels = sum_a.numel()
+    pct_over_09 = (count_over_09 / total_pixels) * 100 if total_pixels > 0 else 0
+    print(f"[Abundances > 0.9] Pixels: {count_over_09:,} of {total_pixels:,} ({pct_over_09:.2f}%)")
+
+    is_abundance_a = torch.allclose(sum_a, torch.ones_like(sum_a), atol=0.5)
+    if is_abundance_a:
+        print("[Abundance Check A] ✅ Dim=-1 sums perfectly to 1.0 (Valid Abundances)")
+
+    # 2. Validate Tensor B & Normalization
+    if tensor_b is not None:
+        stats_b = f"Shape: {list(tensor_b.shape)} | Min: {tensor_b.min().item():.4f} | Max: {tensor_b.max().item():.4f} | Mean: {tensor_b.mean().item():.4f} | Std: {tensor_b.std().item():.4f}"
+        print(f"[Tensor B] {stats_b}")
+        
+        if tensor_a.shape != tensor_b.shape:
+            print(f"⚠️ Warning: Shape mismatch! A: {list(tensor_a.shape)} vs B: {list(tensor_b.shape)}")
+            
+        # Abundance Check for Tensor B (Useful if Tensor B is 'a_norm')
+        sum_b = tensor_b.sum(dim=-1)
+        is_abundance_b = torch.allclose(sum_b, torch.ones_like(sum_b), atol=1e-4)
+        
+        # Quick type detection based on Tensor B's values
+        b_min, b_max, b_mean, b_std = tensor_b.min().item(), tensor_b.max().item(), tensor_b.mean().item(), tensor_b.std().item()
+        
+        if is_abundance_b:
+            print("[Norm/Abundance Check] ✅ Dim=-1 sums to 1.0 (Abundance Normalization)")
+        elif abs(b_mean) < 0.1 and abs(b_std - 1.0) < 0.1:
+            print("[Norm Check] ✅ Standard Normal Scaling (Mean≈0, Std≈1)")
+        elif b_min >= 0.0 and b_max <= 1.0:
+            print("[Norm Check] ✅ Min-Max Scaling [0, 1]")
+        elif b_min >= -1.0 and b_max <= 1.0:
+            print("[Norm Check] ✅ Min-Max Scaling [-1, 1]")
+        else:
+            print("[Norm Check] ⚠️ Custom or incomplete scaling detected")
+
+
 def spectral_angle_mapper(x, y, eps=1e-6):
     """
     SAM loss, NaN-safe.

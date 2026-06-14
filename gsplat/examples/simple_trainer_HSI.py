@@ -31,9 +31,9 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, RootMeanSquaredErrorUsingSlidingWindow, SpectralAngleMapper
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, spectral_angle_mapper, _apply_colormap, WavelengthEncoder, spectral_kl_loss, NaiveHSIUnmixer, cosine_schedule_with_warmup
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, spectral_angle_mapper, _apply_colormap, WavelengthEncoder, spectral_kl_loss, NaiveHSIUnmixer, cosine_schedule_with_warmup, print_test_validation
 from utils_color import spectrum_to_rgb
-from utils_evaluation import EndmemberTracker
+from utils_evaluation import EndmemberTracker, validation_step_with_diagnostics, save_unmixing_diagnostics
 from gsplat import export_splats
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
@@ -270,11 +270,14 @@ class Config:
 
     sam_lambda:float = 0.1
 
-    spectral_smooth_reg: float = 1e-3
-    diversity_reg: float = 5e-3
+    spectral_smooth_reg: float = 1e-4
+    diversity_reg: float = 1e-3
     abundance_reg: float = 1e-2
     psi_reg: float = 1e-2
+    dead_em_reg: float = 1e-3
 
+    temperature_start:float = 3.0
+    temperature_end:float = 0.5
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -386,19 +389,56 @@ def create_splats_with_optimizers(
             params.append(("shN", torch.nn.Parameter(bands[:, 1:, :]), shN_lr))
         
         elif ae_opt:
-            abundances_init = torch.zeros(N, num_endmembers)
-            params.append(("abundances", torch.nn.Parameter(abundances_init), ae_lr))
+
             if ae_specular:
-                k_coeff = ((sh_degree + 1) ** 2) - 1
+                k_coeff = ((sh_degree + 1) ** 2)
                 if unmixing_model == "naive":
+                    abundances_init = torch.zeros(N, num_endmembers)
+                    params.append(("abundances", torch.nn.Parameter(abundances_init), ae_lr))
                     sh_N = torch.full((N, k_coeff, num_endmembers),0.5)
                     params.append(("shN", torch.nn.Parameter(rgb_to_sh(shN), shN_lr)))
                 elif unmixing_model == "elmm_sh":
-                    sh_N = torch.zeros(N, k_coeff, num_endmembers)
+
+                    abundances_init = 0.1 * torch.randn(N, num_endmembers)                    
+                    dominant = torch.randint(0, num_endmembers, (N,))
+                    abundances_init.scatter_(1, dominant.unsqueeze(1), 2.0)  # logit bias ~2.0 → ~73% probability
+                    params.append(("abundances", torch.nn.Parameter(abundances_init), ae_lr))
+                    
+                    # zero init so for the activation function the psi values are 1
+                    sh_N = torch.zeros(N, k_coeff, num_endmembers) 
                     params.append(("shN", torch.nn.Parameter(sh_N), shN_lr))
-            endmembers = torch.nn.Parameter(
-                torch.rand(num_endmembers, num_spectral_bands)
-            )
+
+                    # specular_sh0 = torch.zeros(N, num_spectral_bands)
+                    # params.append(("specular_sh0", torch.nn.Parameter(specular_sh0), sh0_lr * 0.1))
+
+                if init_mode == "random":
+                    # Spread endmembers across different spectral profiles
+                    bands_idx = torch.linspace(0, num_spectral_bands - 1, num_endmembers)
+                    endmembers_init = torch.zeros(num_endmembers, num_spectral_bands)
+                    sigma = num_spectral_bands / (num_endmembers * 1.5)
+                    for k in range(num_endmembers):
+                        for b in range(num_spectral_bands):
+                            # Gaussian peak at different wavelengths per endmember
+                            endmembers_init[k, b] = torch.exp(
+                                torch.tensor(-0.5 * ((b - bands_idx[k]) / sigma) ** 2)
+                            )
+                    # Convert to logit space (sigmoid inverse), clamped for numerical safety
+                    # IMPROVEMENT: Add small noise to break symmetry
+                    # This ensures gradients flow to all endmembers from start
+                    noise_scale = 0.05
+                    endmembers_init = endmembers_init + noise_scale * torch.randn_like(endmembers_init)
+                    endmembers_init = torch.clamp(endmembers_init, 0.05, 0.95)
+                    
+                    # Convert to logit space (sigmoid inverse), clamped for numerical safety
+                    endmembers = torch.nn.Parameter(
+                        torch.logit(endmembers_init.clamp(0.05, 0.95))
+                    )
+
+                else:
+                    assert init_mode != "random"
+                    endmembers = torch.nn.Parameter(
+                        torch.rand(num_endmembers, num_spectral_bands)
+                    )
         else:
             spectrum = torch.rand((N, num_spectral_bands))
             params.append(("spectrum", torch.nn.Parameter(spectrum), sh0_lr))
@@ -789,7 +829,7 @@ class Runner:
                         sh_degree_for_render = kwargs.pop("sh_degree", self.cfg.sh_degree)
                         num_bands_render = cfg.num_endmembers
                     elif cfg.unmixing_model == "elmm_sh":
-                        sh0 = torch.softmax(self.splats["abundances"], dim=-1) # [N, M] M endmembers
+                        sh0 = self.splats["abundances"] # [N, M] M endmembers
                         shN = self.splats["shN"] # [N, K, M] M bands
                         #print(f"shN Rasterize shape {shN.shape}")
                         colors = torch.cat([sh0, shN.view(shN.shape[0], -1)], dim=1) # [N, M + K*M]
@@ -856,6 +896,8 @@ class Runner:
         if camera_model is None:
             camera_model = self.cfg.camera_model
 
+    
+
 
         # Rasterization
         render_colors, render_alphas, info = rasterization(
@@ -901,16 +943,13 @@ class Runner:
             if cfg.unmixing_model == "elmm_sh":
                 M = cfg.num_endmembers
                 
-                a_raw   = render_colors          # [C, H, W, M]
-                #print(f"Shape a {a.shape}")
-                psi_raw = info["render_psi"]     # [C, H, W, M]  logits offset 0.5
-
-                a_pos = torch.relu(a_raw)
-                a_norm = a_pos / a_pos.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-
-                psi = psi_raw.clamp(min=1e-3)                
+                psi = info["render_psi"]
+                
+                a_norm = F.softmax(render_colors / self.temperature,dim=-1)          # [C, H, W, M]
+            
+                psi_norm = psi 
                 # y_pixel = Σ_k  a_k · ψ_k(ω) · m_k
-                a_psi        = a_norm * psi    # [C, H, W, M]
+                a_psi        = a_norm *  psi   # [C, H, W, M]
                 render_colors = torch.einsum("chwm,mb->chwb", a_psi, E)  # [C, H, W, B]
 
             else:
@@ -928,6 +967,7 @@ class Runner:
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
+        self.temperature = cfg.temperature_start
 
 
         # Dump cfg.
@@ -1043,6 +1083,13 @@ class Runner:
             else:
                 sh_degree_to_use = None
 
+            # self.temperature = (
+            #     cfg.temperature_start
+            #     +
+            #     (cfg.temperature_end
+            #     - cfg.temperature_start)
+            #     * step/cfg.max_steps
+            # )
             # forward
             # the rendering
 
@@ -1163,15 +1210,92 @@ class Runner:
                     endmember_smooth = ((E_spec[:, 1:] - E_spec[:, :-1]) ** 2).mean()
                     loss = loss + cfg.spectral_smooth_reg * endmember_smooth
 
-                    # Endmember Diversity
+                    # PSI 
+                    psi_rendered = info["render_psi"]
+                    psi_loss = ((psi_rendered - 1.0) ** 2).mean()
+                    progress = step / cfg.max_steps
+                    psi_reg_weight = 0.1 * (0.001 / 0.1) ** progress
+                    loss += psi_reg_weight * psi_loss
+
+                    #Endmember Diversity
                     E_norm = F.normalize(E_spec, dim=-1)
                     cos_sim = E_norm @ E_norm.T # [M,M]
                     I = torch.eye(cfg.num_endmembers, device=E_spec.device)
                     loss = loss + cfg.diversity_reg * ((cos_sim - I)**2).mean()
 
-                    # Psi Regularization
-                    psi_raw = info["render_psi"]
-                    loss = loss + cfg.psi_reg * torch.mean((psi_raw - 1)**2)
+                    # NEW: Track endmember usage and apply targeted fixes
+                    a_pos = torch.softmax(info["abundances"] / self.temperature, dim=-1)  # [C, H, W, M]
+                    mean_usage = a_pos.mean(dim=[0, 1, 2])  # [M]
+                    mean_spectral_intensity = E_spec.mean(dim=-1).to(device)
+                    # Identify dead endmembers
+                    dead_threshold = 0.005  # < 0.5% average usage
+                    dead_spectral_threshold = 0.01
+
+                    dead_mask = (mean_usage < dead_threshold) | (mean_spectral_intensity < dead_spectral_threshold)
+
+                    if dead_mask.any():
+
+                        E_spec = torch.sigmoid(self.endmembers)
+                        E_norm = F.normalize(E_spec, dim=-1)
+
+                        alive_mask = ~dead_mask
+
+                        if alive_mask.any():
+
+                            alive_center = E_norm[alive_mask].mean(dim=0)
+
+                            dead_loss = (
+                                (E_norm[dead_mask] - alive_center)
+                                .pow(2)
+                                .mean()
+                            )
+
+                            resurrection_weight = (
+                                cfg.dead_em_reg *
+                                max(
+                                    0.0,
+                                    1.0 - step/(cfg.max_steps*0.3)
+                                )
+                            )
+
+                            loss += resurrection_weight * dead_loss
+
+                    # --- CORPUS DIVERSITY (persistent version) ---
+                    # Don't decay corpus weight to zero — keeps endmembers diverse throughout training
+                    corpus_entropy = -(mean_usage * torch.log(mean_usage + 1e-8)).sum()
+                    corpus_weight_base = 5e-2
+                    corpus_decay = max(0.0, 1.0 - step / (cfg.max_steps * 0.6))
+                    corpus_weight = corpus_weight_base * (1.0 + corpus_decay)  # Never goes to zero
+                    loss = loss - corpus_weight * corpus_entropy
+
+                    # --- ENFORCE MATERIAL-ONLY FOR OPAQUE SURFACES ---
+                    # Prevent psi from hijacking endmember spectra
+                    # psi_rendered = info.get("render_psi", None)
+                    # if psi_rendered is not None:
+                    #     # For opaque regions: psi should be near 1.0 (no appearance modulation)
+                    #     opaque_mask = info.get("opaque_mask", None)  # [C, H, W]
+                        
+                    #     if opaque_mask is not None:
+                    #         # Minimize psi variation in opaque regions
+                    #         psi_opaque = psi_rendered[opaque_mask.unsqueeze(-1).expand_as(psi_rendered)]
+                    #         material_only_loss = torch.mean((psi_opaque - 1.0) ** 2)
+                    #         loss = loss + 0.01 * material_only_loss  # Keep opaque materials material-only
+                        
+                    #     # Global: regularize psi distribution (prevent extreme values)
+                    #     psi_mean = torch.mean(psi_rendered)
+                    #     psi_std = torch.std(psi_rendered)
+                    #     psi_outlier_loss = torch.where(
+                    #         torch.abs(psi_rendered - 1.0) > 1.5,  # Outliers > 1.5 deviation
+                    #         torch.abs(psi_rendered - 1.0) ** 2,   # Penalize heavily
+                    #         torch.zeros_like(psi_rendered)
+                    #     ).mean()
+                    #     loss = loss + 0.02 * psi_outlier_loss
+
+                    # --- PIXEL SPARSITY (unchanged but ensure material separation) ---
+                    pixel_entropy = -(a_pos * torch.log(a_pos + 1e-8)).sum(dim=-1).mean()
+                    pixel_sparsity_weight = cfg.abundance_reg * min(1.0, step / (cfg.max_steps * 0.2))
+                    loss = loss + pixel_sparsity_weight * pixel_entropy
+
 
 
             if cfg.depth_loss:
@@ -1201,7 +1325,16 @@ class Runner:
                 loss += tvloss
 
             step_ratio = step / max_steps
-            opacity_reg_weight = cfg.opacity_reg * min(1.0, max(0.0, (step_ratio - 0.1) / 0.5))
+            if step_ratio < 0.35:
+                # warm-up: 0 → full over first 35%
+                opacity_reg_weight = cfg.opacity_reg * (step_ratio / 0.35)
+            elif step_ratio < 0.70:
+                # hold at full for middle 35%
+                opacity_reg_weight = cfg.opacity_reg
+            else:
+                # taper to 20% in final 30% — let the model refine freely
+                taper = 1.0 - (step_ratio - 0.70) / 0.30 * 0.80
+                opacity_reg_weight = cfg.opacity_reg * max(0.20, taper)
 
             # regularizations
             if cfg.opacity_reg > 0.0: #prevents too many opaque splats
@@ -1494,7 +1627,7 @@ class Runner:
             # ------------------------------------------------------------------ #
             tic = time.time()
 
-            renders, _, info = self.rasterize_splats(   
+            renders, alphas, info = self.rasterize_splats(   
                 camtoworlds=camtoworlds, Ks=Ks,
                 width=width, height=height,
                 near_plane=cfg.near_plane, far_plane=cfg.far_plane,
@@ -1510,8 +1643,8 @@ class Runner:
                 E = torch.sigmoid(self.endmembers).to(device)      # [M, Bands]
 
                 # softmax over endmember dim → proper mixing fractions [1,H,W,M]
-                #ab_gpu  = torch.softmax(abundances, dim=-1)
-                ab_gpu = abundances
+                ab_gpu  = torch.softmax(abundances, dim=-1)
+                #ab_gpu = abundances
                 seg_gpu = torch.argmax(ab_gpu, dim=-1)             # [1,H,W]  int64
                 conf_gpu = ab_gpu.max(dim=-1).values               # [1,H,W]  float
 
@@ -1525,7 +1658,10 @@ class Runner:
                 # reconstruct spectrum on GPU
                 spectrum_pre = renders
 
-                print(f"[ae] abundances [{abundances.min():.3f}, {abundances.max():.3f}]  "
+                print(f"[ae] abundances softmax[{ab_gpu.min():.3f}, {ab_gpu.max():.3f}]  "
+                    f"[ae sum] softmax [{ab_gpu.sum(dim=-1).min()}, {ab_gpu.sum(dim=-1).max()}]",
+                    f"[ae] abundances logits [{abundances.min():.3f}, {abundances.max():.3f}]"
+                    f"[ae] sum logits [{abundances.sum(dim=-1).min()}, {abundances.sum(dim=-1).max()}]"
                     f"E [{E.min():.3f}, {E.max():.3f}]  "
                     f"spectrum_pre [{spectrum_pre.min():.3f}, {spectrum_pre.max():.3f}]")
 
@@ -1571,43 +1707,47 @@ class Runner:
                 metric_lpips.append((i, self.lpips(rgb_gt, rgb_pre).item()))
                 metric_sam.append((i, self.sam(spectrum_gt,spectrum_pre).item()))
                 
-                # pull to CPU once
-                spectrum_pre_cpu = spectrum_pre.cpu()
-                spectrum_gt_cpu  = spectrum_gt.cpu()
-                rgb_pre_cpu      = rgb_pre.cpu()
-                rgb_gt_cpu       = rgb_gt.cpu()
 
-                rgb_pred_np = (rgb_pre_cpu[0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                rgb_gt_np   = (rgb_gt_cpu[0].permute(1, 2, 0).numpy()  * 255).astype(np.uint8)
+                if i == len(valloader) - 1:
+                    validation_step_with_diagnostics(self,step,cfg, renders, alphas, info, spectrum_gt, device)
+                    save_unmixing_diagnostics(f"{cfg.result_dir}/diag",ab_gpu,info["render_psi"],spectrum_gt,spectrum_pre, E, step)
+                    # pull to CPU once
+                    spectrum_pre_cpu = spectrum_pre.cpu()
+                    spectrum_gt_cpu  = spectrum_gt.cpu()
+                    rgb_pre_cpu      = rgb_pre.cpu()
+                    rgb_gt_cpu       = rgb_gt.cpu()
 
-                # -------------------------------------------------------------- #
-                # RGB canvas                                                       #
-                # -------------------------------------------------------------- #
-                imageio.imwrite(
-                    os.path.join(f"{cfg.result_dir}/rgb",
-                                f"{stage}_step{step:04d}_{i:04d}.png"),
-                    np.concatenate([rgb_gt_np, rgb_pred_np], axis=1),
-                )
+                    rgb_pred_np = (rgb_pre_cpu[0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                    rgb_gt_np   = (rgb_gt_cpu[0].permute(1, 2, 0).numpy()  * 255).astype(np.uint8)
 
-                # -------------------------------------------------------------- #
-                # HSI bands canvas                                                 #
-                # -------------------------------------------------------------- #
-                B = spectrum_pre_cpu.shape[1]
-                band_rows = []
-                for b_idx in [0, B // 2, B - 1]:
-                    gt_cm   = _apply_colormap(spectrum_gt_cpu[0, b_idx].numpy(),  cmap="magma")
-                    pred_cm = _apply_colormap(spectrum_pre_cpu[0, b_idx].numpy(), cmap="magma")
-                    band_rows.append(np.concatenate([gt_cm, pred_cm], axis=1))
+                    # -------------------------------------------------------------- #
+                    # RGB canvas                                                       #
+                    # -------------------------------------------------------------- #
+                    imageio.imwrite(
+                        os.path.join(f"{cfg.result_dir}/rgb",
+                                    f"{stage}_step{step:04d}_{i:04d}.png"),
+                        np.concatenate([rgb_gt_np, rgb_pred_np], axis=1),
+                    )
 
-                imageio.imwrite(
-                    os.path.join(f"{cfg.result_dir}/hsi",
-                                f"{stage}_step{step:04d}_{i:04d}.png"),
-                    np.concatenate(band_rows, axis=0),
-                )
+                    # -------------------------------------------------------------- #
+                    # HSI bands canvas                                                 #
+                    # -------------------------------------------------------------- #
+                    B = spectrum_pre_cpu.shape[1]
+                    band_rows = []
+                    for b_idx in [0, B // 2, B - 1]:
+                        gt_cm   = _apply_colormap(spectrum_gt_cpu[0, b_idx].numpy(),  cmap="magma")
+                        pred_cm = _apply_colormap(spectrum_pre_cpu[0, b_idx].numpy(), cmap="magma")
+                        band_rows.append(np.concatenate([gt_cm, pred_cm], axis=1))
+                    
+                    imageio.imwrite(
+                        os.path.join(f"{cfg.result_dir}/hsi",
+                                    f"{stage}_step{step:04d}_{i:04d}.png"),
+                        np.concatenate(band_rows, axis=0),
+                    )
                 # -------------------------------------------------------------- #
                 # SEGMENTATION VISUALIZATION
                 # -------------------------------------------------------------- #
-                if cfg.ae_opt and seg_np is not None and self.endmembers is not None:
+                if cfg.ae_opt and seg_np is not None and self.endmembers is not None and i == len(valloader) - 1:
 
                     prefix = os.path.join(
                         f"{cfg.result_dir}/segmentation",
@@ -1695,7 +1835,7 @@ class Runner:
                 # -------------------------------------------------------------- #
                 # VIRIDIS ENDMEMBER VISUALIZATION
                 # -------------------------------------------------------------- #
-                if cfg.ae_opt and seg_np is not None:
+                if cfg.ae_opt and seg_np is not None and i == len(valloader) - 1:
 
                     os.makedirs(f"{cfg.result_dir}/segmentation", exist_ok=True)
 
@@ -1888,7 +2028,6 @@ class Runner:
             "psnr_mean":  float(np.mean(psnr_values)),  "psnr_std":  float(np.std(psnr_values)),
             "ssim_mean":  float(np.mean(ssim_values)),  "ssim_std":  float(np.std(ssim_values)),
             "lpips_mean": float(np.mean(lpips_values)), "lpips_std": float(np.std(lpips_values)),
-            "sam_mean": float(np.mean(sam_values)),
             "num_samples": len(metric_psnr),
             "per_image": {"psnr": metric_psnr, "ssim": metric_ssim, "lpips": metric_lpips, "image_name": image_name},
             "ellipse_time_seconds": float(ellipse_time),
