@@ -660,27 +660,37 @@ def rasterization(
                 # Split packed colors
                 abundances = colors[..., :M]        # [..., N, M]
                 shN_flat   = colors[..., M:]        # [..., N, K*M]
-                print(f"Abudances in rendering.py {abundances.shape}")
-                print(f"shN_flat in rendering.py {shN_flat.shape}")
-                shN_sh = shN_flat.view(*abundances.shape[:-1], -1, M)  # [N, 15, M]
-                sh0_sh = abundances.unsqueeze(-2)     # [N, 1, M]
-                shs_psi = torch.cat([sh0_sh, shN_sh], dim=-2)  # [N, K, M]              
+               
+                shN_sh = shN_flat.view(*abundances.shape[:-1], -1, M)  # [N, K, M]
     
 
                 # Evaluate SH residual per direction
                 psi_view  = _spherical_harmonics_hs(
-                    sh_degree, dirs, shs_psi, masks=masks
+                    sh_degree, dirs, shN_sh, masks=masks
                 )  # [..., C, N, M]
                 
-                psi_view = psi_view + 0.5  # logits for sigmoid in rasterize_splats()
-
+                # The SH can gives us negative values
+                # The psi is constraint to be > 0
+                psi = torch.exp(psi_view.clamp(-1.0, 1.0))    # [..., C, N, M], positive
+                #print(f"Values Range Rendering.py psi [{psi.min()},{psi.max()}]")
                 # Broadcast abundances over cameras
+                
+                # # NEW: For opaque regions, pull psi toward 1.0 (no appearance modulation)
+                # # This prevents specular hijacking by forcing appearance into separate channel
+                # psi_centered = psi - 1.0  # Deviation from neutral
+                # psi_regularized = psi_centered * torch.exp(-5.0 * psi_centered**2)  # Soft penalty
+                # psi = 1.0 + psi_regularized  # Keep psi near 1 but allow variation
+
+                # Clamp to reasonable range [0.3, 3.0] to prevent divergence
+                # psi = torch.clamp(psi, 0.3, 3.0)
+                
                 abundances_bc  = torch.broadcast_to(
                     abundances[..., None, :, :], batch_dims + (C, N, M)
                 )  # [..., C, N, M]
                 
                 # Pack back together for single rasterization pass
-                colors = torch.cat([abundances_bc, psi_view], dim=-1)  # [..., C, N, 2M]
+                colors = torch.cat([abundances_bc, psi], dim=-1)  # [..., C, N, 2M]
+
 
         # sh for RGB
         else:
@@ -855,11 +865,26 @@ def rasterization(
         # render_colors es [..., C, H, W, 2M]
         M = num_endmembers
         render_abundances = render_colors[..., :M]   # [..., C, H, W, M]
-        render_psi        = render_colors[..., M:]   # [..., C, H, W, M] logits with +0.5
+        render_psi        = render_colors[..., M:]   # [..., C, H, W, M]
 
         meta["render_psi"]  = render_psi
-        meta["abundances"]   = render_abundances    
-        render_colors = render_abundances            
+        meta["abundances"]   = render_abundances  
+
+        # # NEW: Constrain to physical space BEFORE composition
+        # # Softmax ensures abundances sum to 1 per pixel (physical unmixing constraint)
+        # render_abundances_normalized = torch.softmax(render_abundances, dim=-1)  # [C,H,W,M] ∈ [0,1]
+
+        # # Material opacity: account for psi influence on apparent opacity
+        # # Opaque material (psi ≈ 1) should contribute full alpha
+        # # Specular material (psi >> 1) adds extra apparent opacity
+        # material_opacity_factor = torch.mean(render_psi, dim=-1, keepdim=True)  # [C,H,W,1]
+        # material_opacity_factor = torch.clamp(material_opacity_factor, 1.0, 2.0)  # [1, 2] range
+
+        # # Final alpha: base_alpha * (normalized abundances) * (material opacity)
+        # abundance_sum = torch.sum(render_abundances_normalized, dim=-1, keepdim=True)  # Should be ~1.0
+        # render_alphas = render_alphas * abundance_sum * material_opacity_factor
+        render_colors = meta["abundances"]            
+
     elif unmixing_model == "naive":
         meta["abundances"] = render_colors
     
